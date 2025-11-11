@@ -1,341 +1,516 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Optional, Dict, Tuple, List
+
+import ccxt
 import pandas as pd
-from dataclasses import dataclass
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    Float,
+    DateTime,
+)
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+from . import config
+from .telegram_client import send_telegram
+from .strategy_pa import PAStrategyState, generate_signal, PAStrategyParams
 
 
-# ========= 策略参数 =========
+# ========== 风险 & 保证金参数 ==========
 
-@dataclass
-class PAStrategyParams:
-    enable_breakout: bool = True
-    enable_reversal: bool = True
-    enable_climax: bool = True
-    enable_failedBO: bool = True
-
-    use_IBS_filter: bool = True
-    IBS_threshold: float = 0.69          # Bullish IBS
-    IBS_threshold_bear: float = 0.31     # Bearish IBS
-
-    use_MIG_filter: bool = True          # 是否使用 Micro Gap 过滤
-    skip_late_wave: bool = True          # 是否跳过晚段（第3、4腿）
-    skip_early_time: bool = False        # 是否跳过开盘前 X 分钟
-    session_start_hour: int = 9          # 交易时段开始（小时）
-    session_start_min: int = 30          # 交易时段开始（分钟）
-    early_session_cutoff_min: int = 40   # 跳过前多少分钟
+# 维持保证金率（比如 0.005 = 0.5%）
+MAINTENANCE_MARGIN_RATE: float = getattr(config, "MAINTENANCE_MARGIN_RATE", 0.005)
 
 
-@dataclass
-class PAStrategyState:
+# ========== 数据库初始化 ==========
+
+if not config.DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set. Please configure it in Railway env vars.")
+
+engine = create_engine(config.DATABASE_URL, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+Base = declarative_base()
+
+
+# ========== ORM 模型 ==========
+
+class Account(Base):
+    __tablename__ = "accounts"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True)
+    equity = Column(Float, default=0)  # 当前总权益（已实现盈亏 + 手续费）
+    cash = Column(Float, default=0)    # 简化模型下的“现金”
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Position(Base):
+    __tablename__ = "positions"
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String, index=True)
+    side = Column(String)             # "long" / "short"
+    size = Column(Float)              # 仓位数量（正数）
+    entry_price = Column(Float)
+    atr = Column(Float)
+    stop_loss = Column(Float)
+    take_profit = Column(Float)
+    opened_at = Column(DateTime, default=datetime.utcnow)
+    closed = Column(Integer, default=0)  # 0=持仓中, 1=已平仓
+    account_id = Column(Integer)
+
+
+class Trade(Base):
+    __tablename__ = "trades"
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String, index=True)
+    side = Column(String)              # "long" / "short"
+    size = Column(Float)
+    entry_price = Column(Float)
+    exit_price = Column(Float)
+    pnl = Column(Float)                # 净利润（含手续费）
+    opened_at = Column(DateTime)
+    closed_at = Column(DateTime)
+    reason = Column(String)            # "tp_sl_or_reverse" / "liquidation" 等
+    account_id = Column(Integer)
+
+
+def init_db_and_account():
+    """建表 + 初始化虚拟账户"""
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        acc = db.query(Account).filter_by(name="paper").first()
+        if not acc:
+            acc = Account(
+                name="paper",
+                equity=config.START_EQUITY,
+                cash=config.START_EQUITY,
+            )
+            db.add(acc)
+            db.commit()
+    finally:
+        db.close()
+
+
+# ========== 行情交易所 ==========
+
+exchange = getattr(ccxt, config.EXCHANGE_ID)()
+
+
+def fetch_ohlcv_df(symbol: str, limit: int = 200) -> pd.DataFrame:
     """
-    用来保存趋势阶段相关状态。
-    简化版：
-      - trend_dir:  1 = 上升趋势, -1 = 下降趋势, 0 = 无明显趋势
-      - leg_count:  当前趋势方向上的“推进腿数”粗略计数
+    从交易所拉 OHLCV，并转为 DataFrame：
+      ts, open, high, low, close, volume
     """
-    trend_dir: int = 0
-    leg_count: int = 0
-
-
-# ========= 指标计算 =========
-
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    计算：
-      - range
-      - ATR10 (简单用10期均值)
-      - IBS
-      - Micro Gap (bull_mig / bear_mig)
-      - session_minute (当天第几分钟)
-    """
-    df = df.copy()
-    df["range"] = df["high"] - df["low"]
-    df["atr10"] = df["range"].rolling(10).mean()
-
-    # IBS: (close - low)/(high - low)，高低价相等时给一个中性值 0.5
-    rng = df["high"] - df["low"]
-    ibs = (df["close"] - df["low"]) / rng.replace(0, pd.NA)
-    ibs = ibs.clip(0, 1).fillna(0.5)
-    df["ibs"] = ibs
-
-    # Micro Gap：当前 low 在前两根 high 之上 / 当前 high 在前两根 low 之下
-    df["bull_mig"] = (df["low"] > df["high"].shift(1)) & (df["low"] > df["high"].shift(2))
-    df["bear_mig"] = (df["high"] < df["low"].shift(1)) & (df["high"] < df["low"].shift(2))
-
-    # 会话内分钟数（用时间戳的小时/分钟近似）
-    if "ts" in df.columns:
-        ts = pd.to_datetime(df["ts"])
-    else:
-        ts = pd.to_datetime(df.index)
-
-    df["session_minute"] = ts.dt.hour * 60 + ts.dt.minute
-
+    ohlcv = exchange.fetch_ohlcv(symbol, config.TIMEFRAME, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     return df
 
 
-def compute_trend_state(df: pd.DataFrame, state: PAStrategyState) -> None:
+# ========== 帐户 & 持仓工具函数 ==========
+
+def get_account(db) -> Account:
+    return db.query(Account).filter_by(name="paper").first()
+
+
+def get_open_positions(db, acc_id: int) -> List[Position]:
+    return db.query(Position).filter_by(account_id=acc_id, closed=0).all()
+
+
+# ========== 单个持仓的保证金 & 爆仓价计算 ==========
+
+def compute_position_margin_and_liq(pos: Position) -> Tuple[float, float, float, float]:
     """
-    简化版趋势 & 腿数估计：
-      - 使用 close 相对 EMA20 的位置确定 trend_dir
-      - 在最近 20 根里统计“创新高次数”(多头)或“创新低次数”(空头)作为 leg_count
+    返回：
+      notional        名义价值 = entry_price * size
+      initial_margin  初始保证金 = notional / MAX_LEVERAGE
+      maint_margin    维持保证金 = notional * MAINTENANCE_MARGIN_RATE
+      liq_price       简化版爆仓价（按 isolated 模型推导）
     """
-    if len(df) < 20:
-        state.trend_dir = 0
-        state.leg_count = 0
+    notional = pos.entry_price * pos.size
+    lev = config.MAX_LEVERAGE
+
+    initial_margin = notional / lev
+    maint_margin = notional * MAINTENANCE_MARGIN_RATE
+
+    # 简化公式：
+    # 对多头：IM + (P_liq - entry) * size = MM
+    # 对空头：IM + (entry - P_liq) * size = MM
+    if pos.side == "long":
+        liq_price = pos.entry_price + (maint_margin - initial_margin) / pos.size
+    else:
+        liq_price = pos.entry_price - (maint_margin - initial_margin) / pos.size
+
+    return notional, initial_margin, maint_margin, liq_price
+
+
+# ========== 全账户：保证金 / 杠杆 / 未实现盈亏 统计 ==========
+
+def compute_account_margin_and_unrealized(
+    db,
+    acc: Account,
+):
+    """
+    返回：
+      stats: {
+        total_notional,
+        used_margin,
+        maint_margin_total,
+        total_unrealized,
+        equity_mtm,
+        free_margin,
+        account_leverage
+      }
+      price_map: { symbol: last_price }
+      positions: 当前所有未平仓持仓列表
+    """
+    positions = get_open_positions(db, acc.id)
+    total_notional = 0.0
+    used_margin = 0.0
+    maint_margin_total = 0.0
+    total_unrealized = 0.0
+    price_map: Dict[str, float] = {}
+
+    for pos in positions:
+        # 为了更真实，单独拉该 symbol 最新一根 K
+        try:
+            df = fetch_ohlcv_df(pos.symbol, limit=1)
+            last_price = float(df.iloc[-1]["close"])
+        except Exception:
+            # 拉失败就退化为用 entry_price
+            last_price = float(pos.entry_price)
+
+        price_map[pos.symbol] = last_price
+
+        notional, im, mm, _ = compute_position_margin_and_liq(pos)
+        total_notional += notional
+        used_margin += im
+        maint_margin_total += mm
+
+        # 未实现盈亏（mark-to-market）
+        if pos.side == "long":
+            total_unrealized += (last_price - pos.entry_price) * pos.size
+        else:
+            total_unrealized += (pos.entry_price - last_price) * pos.size
+
+    # 按市值计的账户权益
+    equity_mtm = acc.equity + total_unrealized
+    free_margin = equity_mtm - used_margin
+    account_leverage = total_notional / equity_mtm if equity_mtm > 0 else float("inf")
+
+    stats = dict(
+        total_notional=total_notional,
+        used_margin=used_margin,
+        maint_margin_total=maint_margin_total,
+        total_unrealized=total_unrealized,
+        equity_mtm=equity_mtm,
+        free_margin=free_margin,
+        account_leverage=account_leverage,
+    )
+    return stats, price_map, positions
+
+
+# ========== 账户快照推送到 Telegram ==========
+
+def send_account_snapshot(db, acc: Account, prefix: str = "[账户快照]"):
+    """
+    将当前账户整体情况推送到 Telegram：
+      - 实现权益 equity
+      - 按市值计的权益 equity_mtm
+      - 已用保证金 / 可用保证金
+      - 总名义仓位 / 杠杆
+      - 当前持仓数量
+    """
+    try:
+        stats, _, positions = compute_account_margin_and_unrealized(db, acc)
+    except Exception as e:
+        print("send_account_snapshot error:", repr(e))
         return
 
-    close = df["close"]
-    ema20 = close.ewm(span=20, adjust=False).mean()
-
-    last_close = close.iloc[-1]
-    last_ema = ema20.iloc[-1]
-
-    if last_close > last_ema:
-        trend_dir = 1
-    elif last_close < last_ema:
-        trend_dir = -1
-    else:
-        trend_dir = 0
-
-    # 统计腿数：最近 20 根中创新高/创新低的次数
-    leg_count = 0
-    if trend_dir == 1:
-        highs = df["high"].tail(20).to_list()
-        max_h = highs[0]
-        for h in highs[1:]:
-            if h > max_h:
-                leg_count += 1
-                max_h = h
-    elif trend_dir == -1:
-        lows = df["low"].tail(20).to_list()
-        min_l = lows[0]
-        for l in lows[1:]:
-            if l < min_l:
-                leg_count += 1
-                min_l = l
-    else:
-        leg_count = 0
-
-    state.trend_dir = trend_dir
-    state.leg_count = leg_count
+    text = (
+        f"{prefix}\n"
+        f"Equity(已实现): {acc.equity:.2f}\n"
+        f"Equity(MtM): {stats['equity_mtm']:.2f}\n"
+        f"总名义仓位: {stats['total_notional']:.2f}\n"
+        f"已用保证金(IM): {stats['used_margin']:.2f}\n"
+        f"维持保证金(MM): {stats['maint_margin_total']:.2f}\n"
+        f"可用保证金: {stats['free_margin']:.2f}\n"
+        f"当前杠杆: {stats['account_leverage']:.2f}x\n"
+        f"持仓数: {len(positions)}"
+    )
+    send_telegram(text)
 
 
-# ========= 核心：生成信号 =========
+# ========== 平仓逻辑（含滑点 & 手续费 & 原因） ==========
 
-def generate_signal(
-    df: pd.DataFrame,
-    state: PAStrategyState,
-    params: PAStrategyParams | None = None,
-) -> dict:
+def close_position(
+    db,
+    acc: Account,
+    pos: Position,
+    last_price: float,
+    reason: str = "tp_sl_or_reverse",
+):
     """
-    输入：最近一段 K 线（按时间升序）
-    输出：
-      {
-        "side": "long"/"short"/None,
-        "reason": str,
-        "atr": float,
-        "detail": {各模块布尔条件}
-      }
+    平仓：
+      - 根据方向加滑点得到 exec_price_close
+      - 计算毛利润 pnl_gross
+      - 计算平仓手续费 fee_close
+      - 净利润 pnl_net = pnl_gross - fee_close
+      - 更新账户权益 & 记录 Trade
+      - 推送平仓信息 + 平仓后账户快照
     """
-    if params is None:
+    slippage = config.SLIPPAGE_RATE
+
+    if pos.side == "long":
+        # 多单平仓：卖出，价格略低
+        exec_price_close = last_price * (1 - slippage)
+        pnl_gross = (exec_price_close - pos.entry_price) * pos.size
+    else:
+        # 空单平仓：买入，价格略高
+        exec_price_close = last_price * (1 + slippage)
+        pnl_gross = (pos.entry_price - exec_price_close) * pos.size
+
+    notional_close = exec_price_close * pos.size
+    fee_close = notional_close * config.TAKER_FEE_RATE
+
+    pnl_net = pnl_gross - fee_close
+
+    acc.equity += pnl_net
+    acc.cash += pnl_net
+
+    trade = Trade(
+        symbol=pos.symbol,
+        side=pos.side,
+        size=pos.size,
+        entry_price=pos.entry_price,
+        exit_price=exec_price_close,
+        pnl=pnl_net,
+        opened_at=pos.opened_at,
+        closed_at=datetime.utcnow(),
+        account_id=acc.id,
+        reason=reason,
+    )
+    pos.closed = 1
+    db.add(trade)
+    db.add(acc)
+    db.add(pos)
+
+    send_telegram(
+        f"[平仓][虚拟盘][{reason}] {pos.symbol} {pos.side.upper()} "
+        f"size={pos.size:.4f} 入场={pos.entry_price:.2f} "
+        f"平仓={exec_price_close:.2f} 净PnL={pnl_net:.2f} "
+        f"(fee={fee_close:.4f})"
+    )
+
+    # 平仓后发一条账户快照
+    send_account_snapshot(db, acc, prefix=f"[平仓后账户] {pos.symbol}")
+
+
+# ========== 强平逻辑：权益跌到维持保证金水平自动全平 ==========
+
+def check_and_liquidate(db, acc: Account):
+    """
+    计算市值权益 equity_mtm 和总维持保证金 maint_margin_total：
+      - 如果 equity_mtm <= maint_margin_total，则触发强平：
+        以当前市价（含滑点）一次性平掉所有持仓。
+    """
+    stats, price_map, positions = compute_account_margin_and_unrealized(db, acc)
+
+    equity_mtm = stats["equity_mtm"]
+    maint_margin_total = stats["maint_margin_total"]
+
+    if not positions:
+        return
+
+    if equity_mtm <= maint_margin_total:
+        send_telegram(
+            f"[强平触发] equity_mtm={equity_mtm:.2f}, "
+            f"maint_margin_total={maint_margin_total:.2f}, "
+            f"positions={len(positions)}"
+        )
+
+        for pos in positions:
+            last_price = price_map.get(pos.symbol, pos.entry_price)
+            close_position(db, acc, pos, last_price, reason="liquidation")
+
+        # 强平后再发一次整体账户快照
+        send_account_snapshot(db, acc, prefix="[强平完成后账户]")
+
+
+# ========== 仓位大小：ATR + 单笔风险 + 杠杆限制 ==========
+
+def calc_position_size(equity: float, atr: float, price: float) -> float:
+    """
+    合约版仓位计算：
+      - 单笔风险单元：equity * RISK_PER_TRADE_PCT
+      - ATR 作为止损距离，raw_qty = risk_amount / atr
+      - 杠杆限制：notional <= equity * MAX_LEVERAGE
+    """
+    if atr <= 0 or price <= 0 or equity <= 0:
+        return 0.0
+
+    risk_amount = equity * (config.RISK_PER_TRADE_PCT / 100.0)
+    raw_qty = risk_amount / atr
+
+    # 单笔仓位名义价值的最大上限（不超过账户可用杠杆）
+    max_notional_by_lev = equity * config.MAX_LEVERAGE
+    cap_qty_by_lev = max_notional_by_lev / price
+
+    qty = min(raw_qty, cap_qty_by_lev)
+    return max(qty, 0.0)
+
+
+def get_total_notional(db, acc: Account) -> float:
+    """当前所有持仓的总名义价值（按开仓价）"""
+    positions = get_open_positions(db, acc.id)
+    return sum(pos.entry_price * pos.size for pos in positions)
+
+
+# ========== 主循环：每轮跑所有币种 + 杠杆检查 + 强平检查 ==========
+
+def run_cycle_once():
+    """
+    每轮执行：
+      - 先获取当前总名义仓位（用于账户杠杆限制）
+      - 对每个 symbol：
+          1) 拉历史K线
+          2) 用策略生成信号
+          3) 如果有持仓 -> 检查 TP/SL
+          4) 如果空仓 -> 检查账户杠杆 -> 开新仓（含滑点 & 手续费）
+             → 每次开仓后推送一条账户快照
+      - 最后跑一次强平检查（equity_mtm vs 维持保证金）
+    """
+    db = SessionLocal()
+    try:
+        acc = get_account(db)
+        if not acc:
+            return
+
         params = PAStrategyParams()
+        total_notional_existing = get_total_notional(db, acc)
 
-    if df is None or len(df) < 20:
-        return {"side": None, "reason": "not_enough_bars", "atr": None, "detail": {}}
+        for symbol in config.SYMBOLS:
+            try:
+                df = fetch_ohlcv_df(symbol)
+            except Exception as e:
+                print(f"fetch_ohlcv error for {symbol}:", repr(e))
+                continue
 
-    df = compute_indicators(df)
-    compute_trend_state(df, state)
+            if df is None or df.empty:
+                continue
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    prev2 = df.iloc[-3]
+            state = PAStrategyState()
+            sig = generate_signal(df, state, params)
 
-    atr10 = float(last["atr10"])
-    if pd.isna(atr10) or atr10 <= 0:
-        return {"side": None, "reason": "no_atr", "atr": None, "detail": {}}
+            side = sig.get("side")
+            atr = sig.get("atr")
+            reason = sig.get("reason", "unknown")
 
-    ibs = float(last["ibs"])
-    ibs_prev = float(prev["ibs"])
+            last = df.iloc[-1]
+            last_price = float(last["close"])
 
-    bull_MIG = bool(last["bull_mig"])
-    bear_MIG = bool(last["bear_mig"])
+            # 当前 symbol 是否已有持仓
+            pos = (
+                db.query(Position)
+                .filter_by(symbol=symbol, account_id=acc.id, closed=0)
+                .first()
+            )
 
-    trendDir = state.trend_dir
-    legCount = state.leg_count
+            # --- 1) 有持仓：检查 TP / SL ---
+            if pos and pos.closed == 0:
+                if pos.side == "long":
+                    hit_sl = last_price <= pos.stop_loss
+                    hit_tp = last_price >= pos.take_profit
+                else:
+                    hit_sl = last_price >= pos.stop_loss
+                    hit_tp = last_price <= pos.take_profit
 
-    # Session 过滤（早盘跳过）
-    session_minute = int(last["session_minute"])
-    session_start_total = params.session_start_hour * 60 + params.session_start_min
-    early_cutoff = session_start_total + params.early_session_cutoff_min
-    early_ok = (not params.skip_early_time) or (session_minute >= early_cutoff)
+                if hit_sl or hit_tp:
+                    close_position(db, acc, pos, last_price, reason="tp_sl_or_reverse")
 
-    # ========== Breakout Strategy ==========
-    brk_long_cond = False
-    brk_short_cond = False
+                # 有持仓时暂时不反向开仓，避免过度复杂
+                continue
 
-    if params.enable_breakout:
-        # Bullish breakout: 两根 K 线的延续突破
-        prev_up_break = prev["high"] > prev2["high"]
-        prev_bull = prev["close"] > prev["open"]
-        curr_bull = last["close"] > last["open"]
-        size_ok = max(prev["range"], prev2["range"]) >= atr10
-        ibs_ok_prev = ibs_prev >= params.IBS_threshold
-        strength_ok = (ibs_ok_prev if params.use_IBS_filter else True)
+            # --- 2) 无持仓：看是否开新仓 ---
+            if side not in ("long", "short") or atr is None:
+                continue
 
-        if prev_up_break and prev_bull and curr_bull and size_ok and strength_ok:
-            if (not params.skip_late_wave) or (legCount < 2):
-                if early_ok:
-                    if (not params.use_IBS_filter) or (ibs >= 0.5):
-                        brk_long_cond = True
+            # 基于当前账户权益按 ATR 计算目标仓位
+            qty = calc_position_size(acc.equity, atr, last_price)
+            if qty <= 0:
+                continue
 
-        # Bearish breakout
-        prev_down_break = prev["low"] < prev2["low"]
-        prev_bear = prev["close"] < prev["open"]
-        curr_bear = last["close"] < last["open"]
-        size_ok_down = max(prev["range"], prev2["range"]) >= atr10
-        ibs_ok_prev_down = ibs_prev <= params.IBS_threshold_bear
-        strength_ok_down = (ibs_ok_prev_down if params.use_IBS_filter else True)
+            # 用滑点计算预期开仓价格 + 名义价值
+            slippage = config.SLIPPAGE_RATE
+            if side == "long":
+                exec_price = last_price * (1 + slippage)
+            else:
+                exec_price = last_price * (1 - slippage)
 
-        if prev_down_break and prev_bear and curr_bear and size_ok_down and strength_ok_down:
-            if (not params.skip_late_wave) or (legCount < 2):
-                if early_ok:
-                    if (not params.use_IBS_filter) or (ibs <= 0.5):
-                        brk_short_cond = True
+            new_notional = exec_price * qty
 
-    # ========== Climax Follow-through Strategy ==========
-    climax_long_cond = False
-    climax_short_cond = False
+            # 帐户层面的总杠杆限制：
+            # (已有总名义 + 新仓位名义) / 实现权益 <= MAX_LEVERAGE
+            if acc.equity <= 0:
+                continue
 
-    if params.enable_climax:
-        # Bullish climax
-        huge_bull = last["close"] > last["open"] and last["range"] >= 2 * atr10
-        prior_bull = prev["close"] > prev["open"]
-        not_reversal_bar = prior_bull
+            projected_total_notional = total_notional_existing + new_notional
+            projected_leverage = projected_total_notional / acc.equity
 
-        if huge_bull and not_reversal_bar:
-            momentum_gap = bull_MIG
-            if ((not params.skip_late_wave) or (legCount < 2)) and \
-               ((not params.use_MIG_filter) or momentum_gap or legCount < 2):
-                climax_long_cond = True
+            if projected_leverage > config.MAX_LEVERAGE:
+                # 杠杆上限超标，不开新仓
+                send_telegram(
+                    f"[拒绝开仓][杠杆过高] {symbol} 预期杠杆={projected_leverage:.2f} "
+                    f"上限={config.MAX_LEVERAGE:.2f}"
+                )
+                continue
 
-        # Bearish climax
-        huge_bear = last["close"] < last["open"] and last["range"] >= 2 * atr10
-        prior_bear = prev["close"] < prev["open"]
-        not_reversal_bar_down = prior_bear
+            # --- 3) 名义合理，正式建仓 ---
+            notional_open = new_notional
+            fee_open = notional_open * config.TAKER_FEE_RATE
 
-        if huge_bear and not_reversal_bar_down:
-            momentum_gap_down = bear_MIG
-            if ((not params.skip_late_wave) or (legCount < 2)) and \
-               ((not params.use_MIG_filter) or momentum_gap_down or legCount < 2):
-                climax_short_cond = True
+            # 立即扣除开仓手续费
+            acc.equity -= fee_open
+            acc.cash -= fee_open
 
-    # ========== Failed Breakout Reversal ==========
-    fail_rev_long_cond = False
-    fail_rev_short_cond = False
+            # 止损止盈以开仓成交价为中心
+            if side == "long":
+                sl = exec_price - atr
+                tp = exec_price + 2 * atr
+            else:
+                sl = exec_price + atr
+                tp = exec_price - 2 * atr
 
-    if params.enable_failedBO:
-        # Failed bullish breakout -> 做空
-        prev_breakout_up = (prev["high"] > prev2["high"]) and (prev["close"] > prev["open"])
-        curr_strong_down = (last["close"] < last["open"]) and (last["close"] < prev["low"])
-        curr_outside_down = (last["low"] < prev["low"]) and (last["high"] > prev["high"])
+            pos = Position(
+                symbol=symbol,
+                side=side,
+                size=qty,
+                entry_price=exec_price,
+                atr=atr,
+                stop_loss=sl,
+                take_profit=tp,
+                account_id=acc.id,
+            )
+            db.add(pos)
 
-        if prev_breakout_up and (curr_strong_down or curr_outside_down):
-            if (not params.use_IBS_filter) or (ibs <= params.IBS_threshold_bear):
-                fail_rev_short_cond = True
+            total_notional_existing += notional_open  # 更新账户总名义
 
-        # Failed bearish breakout -> 做多
-        prev_breakout_down = (prev["low"] < prev2["low"]) and (prev["close"] < prev["open"])
-        curr_strong_up = (last["close"] > last["open"]) and (last["close"] > prev["high"])
-        curr_outside_up = (last["high"] > prev["high"]) and (last["low"] < prev["low"])
+            send_telegram(
+                f"[开仓][虚拟盘] {symbol} {side.upper()} size={qty:.4f} "
+                f"价格={exec_price:.2f} ATR={atr:.2f} "
+                f"原因={reason} fee_open={fee_open:.4f}"
+            )
 
-        if prev_breakout_down and (curr_strong_up or curr_outside_up):
-            if (not params.use_IBS_filter) or (ibs >= params.IBS_threshold):
-                fail_rev_long_cond = True
+            # 开仓后发一条账户快照
+            send_account_snapshot(db, acc, prefix=f"[开仓后账户] {symbol}")
 
-    # ========== General Two-Bar Reversal ==========
-    rev_long_cond = False
-    rev_short_cond = False
+        # --- 3) 本轮结束后做一次强平检查 ---
+        check_and_liquidate(db, acc)
 
-    if params.enable_reversal:
-        # Bullish reversal
-        bar1_bear = prev["close"] < prev["open"]
-        bull_reversal = (last["close"] > last["open"]) and (last["close"] > prev["high"])
-        bull_rev_bar_strength = (not params.use_IBS_filter) or (ibs >= params.IBS_threshold)
-
-        if bar1_bear and bull_reversal and bull_rev_bar_strength:
-            if (not params.skip_late_wave) or (trendDir == -1):
-                rev_long_cond = True
-
-        # Bearish reversal
-        bar1_bull = prev["close"] > prev["open"]
-        bear_reversal = (last["close"] < last["open"]) and (last["close"] < prev["low"])
-        bear_rev_bar_strength = (not params.use_IBS_filter) or (ibs <= params.IBS_threshold_bear)
-
-        if bar1_bull and bear_reversal and bear_rev_bar_strength:
-            if (not params.skip_late_wave) or (trendDir == 1):
-                rev_short_cond = True
-
-    # ========== 汇总多空信号 ==========
-    long_modules = []
-    short_modules = []
-
-    if brk_long_cond:
-        long_modules.append("breakout")
-    if climax_long_cond:
-        long_modules.append("climax")
-    if fail_rev_long_cond:
-        long_modules.append("failed_breakout")
-    if rev_long_cond:
-        long_modules.append("reversal")
-
-    if brk_short_cond:
-        short_modules.append("breakout")
-    if climax_short_cond:
-        short_modules.append("climax")
-    if fail_rev_short_cond:
-        short_modules.append("failed_breakout")
-    if rev_short_cond:
-        short_modules.append("reversal")
-
-    side = None
-    reason = "no_signal"
-
-    # 如果多空同时出现，就简单按“失败突破 > 突破 > 反转 > climax”优先级
-    if long_modules and not short_modules:
-        side = "long"
-        priority = ["failed_breakout", "breakout", "reversal", "climax"]
-        for r in priority:
-            if r in long_modules:
-                reason = f"{r}_long"
-                break
-    elif short_modules and not long_modules:
-        side = "short"
-        priority = ["failed_breakout", "breakout", "reversal", "climax"]
-        for r in priority:
-            if r in short_modules:
-                reason = f"{r}_short"
-                break
-    elif long_modules and short_modules:
-        # 极端情况：同时触发多空，这里选择“不交易”
-        side = None
-        reason = "conflict_long_short"
-
-    detail = {
-        "brk_long": brk_long_cond,
-        "brk_short": brk_short_cond,
-        "climax_long": climax_long_cond,
-        "climax_short": climax_short_cond,
-        "fail_rev_long": fail_rev_long_cond,
-        "fail_rev_short": fail_rev_short_cond,
-        "rev_long": rev_long_cond,
-        "rev_short": rev_short_cond,
-        "trendDir": trendDir,
-        "legCount": legCount,
-        "ibs": ibs,
-        "atr10": atr10,
-    }
-
-    return {
-        "side": side,
-        "reason": reason,
-        "atr": atr10,
-        "detail": detail,
-    }
+        db.commit()
+    finally:
+        db.close()
