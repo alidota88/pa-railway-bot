@@ -245,15 +245,16 @@ def send_account_snapshot(db, acc: Account, prefix: str = "[账户快照]"):
 
     text = (
         f"{prefix}\n"
-        f"Equity(已实现): {acc.equity:.2f}\n"
-        f"Equity(MtM): {stats['equity_mtm']:.2f}\n"
-        f"总名义仓位: {stats['total_notional']:.2f}\n"
-        f"已用保证金(IM): {stats['used_margin']:.2f}\n"
-        f"维持保证金(MM): {stats['maint_margin_total']:.2f}\n"
-        f"可用保证金: {stats['free_margin']:.2f}\n"
-        f"当前杠杆: {stats['account_leverage']:.2f}x\n"
-        f"持仓数: {len(positions)}"
+        f"💰 Equity(已实现)：{acc.equity:.2f}\n"
+        f"📈 Equity(MtM)：{stats['equity_mtm']:.2f}\n"
+        f"💼 名义仓位总额：{stats['total_notional']:.2f}\n"
+        f"🔒 已用保证金(IM)：{stats['used_margin']:.2f}\n"
+        f"⚙️ 维持保证金(MM)：{stats['maint_margin_total']:.2f}\n"
+        f"💵 可用保证金：{stats['free_margin']:.2f}\n"
+        f"📊 当前杠杆：{stats['account_leverage']:.2f}x\n"
+        f"📌 持仓数：{len(positions)}"
     )
+
     send_telegram(text)
 
 
@@ -311,12 +312,16 @@ def close_position(
     db.add(acc)
     db.add(pos)
 
-    send_telegram(
-        f"[平仓][虚拟盘][{reason}] {pos.symbol} {pos.side.upper()} "
-        f"size={pos.size:.4f} 入场={pos.entry_price:.2f} "
-        f"平仓={exec_price_close:.2f} 净PnL={pnl_net:.2f} "
-        f"(fee={fee_close:.4f})"
+    pnl_symbol = "🟢" if pnl_net > 0 else "🔴"
+    msg = (
+        f"{pnl_symbol} 平仓：{pos.symbol} {pos.side.upper()}\n"
+        f"数量：{pos.size:.4f}\n"
+        f"入场：{pos.entry_price:.2f}  平仓：{exec_price_close:.2f}\n"
+        f"净收益：{pnl_net:+.2f} USDT  (fee={fee_close:.2f})\n"
+        f"原因：{reason}"
     )
+    send_telegram(msg)
+
 
     # 平仓后发一条账户快照
     send_account_snapshot(db, acc, prefix=f"[平仓后账户] {pos.symbol}")
@@ -515,11 +520,18 @@ def run_cycle_once():
 
             total_notional_existing += notional_open  # 更新账户总名义
 
-            send_telegram(
-                f"[开仓][虚拟盘] {symbol} {side.upper()} size={qty:.4f} "
-                f"价格={exec_price:.2f} ATR={atr:.2f} "
-                f"原因={reason} fee_open={fee_open:.4f}"
+            emoji = "📈" if side == "long" else "📉"
+            msg = (
+                f"{emoji} 开仓：{symbol} {side.upper()}\n"
+                f"数量：{qty:.4f}\n"
+                f"价格：{exec_price:.2f} USDT\n"
+                f"止损：{(exec_price - atr) if side == 'long' else (exec_price + atr):.2f}\n"
+                f"止盈：{(exec_price + 2*atr) if side == 'long' else (exec_price - 2*atr):.2f}\n"
+                f"ATR：{atr:.2f}  手续费：{fee_open:.2f}\n"
+                f"信号来源：{reason}"
             )
+            send_telegram(msg)
+
 
             # 开仓后发一条账户快照
             send_account_snapshot(db, acc, prefix=f"[开仓后账户] {symbol}")
