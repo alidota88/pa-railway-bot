@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Tuple
 
 import ccxt
 import pandas as pd
@@ -20,10 +20,15 @@ from .telegram_client import send_telegram
 from .strategy_pa import PAStrategyState, generate_signal, PAStrategyParams
 
 
-# ================== 数据库初始化 ==================
+# ========== 风险 & 保证金参数 ==========
+
+# 维持保证金率（比如 0.005 = 0.5%）
+MAINTENANCE_MARGIN_RATE: float = getattr(config, "MAINTENANCE_MARGIN_RATE", 0.005)
+
+
+# ========== 数据库初始化 ==========
 
 if not config.DATABASE_URL:
-    # 如果没配置 DATABASE_URL，直接报错，避免悄悄用空连接
     raise RuntimeError("DATABASE_URL is not set. Please configure it in Railway env vars.")
 
 engine = create_engine(config.DATABASE_URL, future=True)
@@ -31,13 +36,13 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, futu
 Base = declarative_base()
 
 
-# ================== ORM 模型 ==================
+# ========== ORM 模型 ==========
 
 class Account(Base):
     __tablename__ = "accounts"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, index=True)
-    equity = Column(Float, default=0)  # 当前总权益
+    equity = Column(Float, default=0)  # 当前总权益（已实现盈亏 + 手续费）
     cash = Column(Float, default=0)    # 简化模型下的“现金”
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -65,15 +70,15 @@ class Trade(Base):
     size = Column(Float)
     entry_price = Column(Float)
     exit_price = Column(Float)
-    pnl = Column(Float)                # 净利润（已扣除手续费）
+    pnl = Column(Float)                # 净利润（含手续费）
     opened_at = Column(DateTime)
     closed_at = Column(DateTime)
-    reason = Column(String)            # 平仓原因（tp/sl/反向/手动等）
+    reason = Column(String)            # "tp_sl_or_reverse" / "liquidation" 等
     account_id = Column(Integer)
 
 
 def init_db_and_account():
-    """建表 + 初始化一个虚拟账户（paper）"""
+    """建表 + 初始化虚拟账户"""
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
@@ -90,14 +95,14 @@ def init_db_and_account():
         db.close()
 
 
-# ================== 交易所（行情） ==================
+# ========== 行情交易所 ==========
 
 exchange = getattr(ccxt, config.EXCHANGE_ID)()
 
 
 def fetch_ohlcv_df(symbol: str, limit: int = 200) -> pd.DataFrame:
     """
-    从交易所拉 OHLCV，转为 DataFrame：
+    从交易所拉 OHLCV，并转为 DataFrame：
       ts, open, high, low, close, volume
     """
     ohlcv = exchange.fetch_ohlcv(symbol, config.TIMEFRAME, limit=limit)
@@ -106,29 +111,125 @@ def fetch_ohlcv_df(symbol: str, limit: int = 200) -> pd.DataFrame:
     return df
 
 
-# ================== 帐户 / 持仓工具函数 ==================
+# ========== 帐户 & 持仓工具函数 ==========
 
 def get_account(db) -> Account:
     return db.query(Account).filter_by(name="paper").first()
 
 
-def get_open_position(db, symbol: str, acc_id: int) -> Optional[Position]:
-    return (
-        db.query(Position)
-        .filter_by(symbol=symbol, account_id=acc_id, closed=0)
-        .first()
-    )
+def get_open_positions(db, acc_id: int):
+    return db.query(Position).filter_by(account_id=acc_id, closed=0).all()
 
 
-# ================== 平仓（包含滑点 & 手续费） ==================
+# ========== 单个持仓的保证金 & 爆仓价计算 ==========
 
-def close_position(db, acc: Account, pos: Position, last_price: float):
+def compute_position_margin_and_liq(pos: Position) -> Tuple[float, float, float, float]:
     """
-    平仓时：
-      - 使用滑点计算实际成交价格 exec_price_close
+    返回：
+      notional        名义价值 = entry_price * size
+      initial_margin  初始保证金 = notional / MAX_LEVERAGE
+      maint_margin    维持保证金 = notional * MAINTENANCE_MARGIN_RATE
+      liq_price       简化版爆仓价（按 isolated 模型推导）
+    """
+    notional = pos.entry_price * pos.size
+    lev = config.MAX_LEVERAGE
+
+    initial_margin = notional / lev
+    maint_margin = notional * MAINTENANCE_MARGIN_RATE
+
+    # 简化公式：
+    # 对多头：IM + (P_liq - entry) * size = MM
+    # 对空头：IM + (entry - P_liq) * size = MM
+    if pos.side == "long":
+        liq_price = pos.entry_price + (maint_margin - initial_margin) / pos.size
+    else:
+        liq_price = pos.entry_price - (maint_margin - initial_margin) / pos.size
+
+    return notional, initial_margin, maint_margin, liq_price
+
+
+# ========== 全账户：保证金 / 杠杆 / 未实现盈亏 统计 ==========
+
+def compute_account_margin_and_unrealized(
+    db,
+    acc: Account,
+) -> Tuple[Dict[str, float], Dict[str, float], list[Position]]:
+    """
+    返回：
+      stats: {
+        total_notional,
+        used_margin,
+        maint_margin_total,
+        total_unrealized,
+        equity_mtm,
+        free_margin,
+        account_leverage
+      }
+      price_map: { symbol: last_price }
+      positions: 当前所有未平仓持仓列表
+    """
+    positions = get_open_positions(db, acc.id)
+    total_notional = 0.0
+    used_margin = 0.0
+    maint_margin_total = 0.0
+    total_unrealized = 0.0
+    price_map: Dict[str, float] = {}
+
+    for pos in positions:
+        # 为了更真实，单独拉该 symbol 最新一根 K
+        try:
+            df = fetch_ohlcv_df(pos.symbol, limit=1)
+            last_price = float(df.iloc[-1]["close"])
+        except Exception:
+            # 拉失败就退化为用 entry_price
+            last_price = float(pos.entry_price)
+
+        price_map[pos.symbol] = last_price
+
+        notional, im, mm, _ = compute_position_margin_and_liq(pos)
+        total_notional += notional
+        used_margin += im
+        maint_margin_total += mm
+
+        # 未实现盈亏（mark-to-market）
+        if pos.side == "long":
+            total_unrealized += (last_price - pos.entry_price) * pos.size
+        else:
+            total_unrealized += (pos.entry_price - last_price) * pos.size
+
+    # 按市值计的账户权益
+    equity_mtm = acc.equity + total_unrealized
+    free_margin = equity_mtm - used_margin
+    account_leverage = total_notional / equity_mtm if equity_mtm > 0 else float("inf")
+
+    stats = dict(
+        total_notional=total_notional,
+        used_margin=used_margin,
+        maint_margin_total=maint_margin_total,
+        total_unrealized=total_unrealized,
+        equity_mtm=equity_mtm,
+        free_margin=free_margin,
+        account_leverage=account_leverage,
+    )
+    return stats, price_map, positions
+
+
+# ========== 平仓逻辑（含滑点 & 手续费 & 原因） ==========
+
+def close_position(
+    db,
+    acc: Account,
+    pos: Position,
+    last_price: float,
+    reason: str = "tp_sl_or_reverse",
+):
+    """
+    平仓：
+      - 根据方向加滑点得到 exec_price_close
       - 计算毛利润 pnl_gross
       - 计算平仓手续费 fee_close
-      - 净利润 pnl_net = pnl_gross - fee_close，计入 equity / cash
+      - 净利润 pnl_net = pnl_gross - fee_close
+      - 更新账户权益 & 记录 Trade
     """
     slippage = config.SLIPPAGE_RATE
 
@@ -159,7 +260,7 @@ def close_position(db, acc: Account, pos: Position, last_price: float):
         opened_at=pos.opened_at,
         closed_at=datetime.utcnow(),
         account_id=acc.id,
-        reason="tp/sl_or_reverse",
+        reason=reason,
     )
     pos.closed = 1
     db.add(trade)
@@ -167,30 +268,60 @@ def close_position(db, acc: Account, pos: Position, last_price: float):
     db.add(pos)
 
     send_telegram(
-        f"[平仓][虚拟盘] {pos.symbol} {pos.side.upper()} "
+        f"[平仓][虚拟盘][{reason}] {pos.symbol} {pos.side.upper()} "
         f"size={pos.size:.4f} 入场={pos.entry_price:.2f} "
         f"平仓={exec_price_close:.2f} 净PnL={pnl_net:.2f} "
-        f"(含手续费 {fee_close:.4f})"
+        f"(fee={fee_close:.4f})"
     )
 
 
-# ================== 仓位计算（合约 + 杠杆 + ATR 风险） ==================
+# ========== 强平逻辑：权益跌到维持保证金水平自动全平 ==========
+
+def check_and_liquidate(db, acc: Account):
+    """
+    计算市值权益 equity_mtm 和总维持保证金 maint_margin_total：
+      - 如果 equity_mtm <= maint_margin_total，则触发强平：
+        以当前市价（含滑点）一次性平掉所有持仓。
+    """
+    stats, price_map, positions = compute_account_margin_and_unrealized(db, acc)
+
+    equity_mtm = stats["equity_mtm"]
+    maint_margin_total = stats["maint_margin_total"]
+
+    if not positions:
+        return
+
+    if equity_mtm <= maint_margin_total:
+        send_telegram(
+            f"[强平触发] equity_mtm={equity_mtm:.2f}, "
+            f"maint_margin_total={maint_margin_total:.2f}, "
+            f"positions={len(positions)}"
+        )
+
+        for pos in positions:
+            last_price = price_map.get(pos.symbol, pos.entry_price)
+            close_position(db, acc, pos, last_price, reason="liquidation")
+
+        # 强平后再 commit（外层 run_cycle_once 会再次 commit，但这里优先落地）
+        db.commit()
+
+
+# ========== 仓位大小：ATR + 单笔风险 + 杠杆限制 ==========
 
 def calc_position_size(equity: float, atr: float, price: float) -> float:
     """
     合约版仓位计算：
-      - 单笔风险：equity * RISK_PER_TRADE_PCT
+      - 单笔风险单元：equity * RISK_PER_TRADE_PCT
       - ATR 作为止损距离，raw_qty = risk_amount / atr
-      - 杠杆限制：notional = price * qty <= equity * MAX_LEVERAGE
+      - 杠杆限制：notional <= equity * MAX_LEVERAGE
     """
     if atr <= 0 or price <= 0 or equity <= 0:
         return 0.0
 
-    # 单笔风险金额（1R）
     risk_amount = equity * (config.RISK_PER_TRADE_PCT / 100.0)
     raw_qty = risk_amount / atr
 
-    # 杠杆限制：单笔名义价值不能超过 equity * MAX_LEVERAGE
+    # 单笔仓位名义价值的最大上限（不超过账户可用杠杆）
     max_notional_by_lev = equity * config.MAX_LEVERAGE
     cap_qty_by_lev = max_notional_by_lev / price
 
@@ -198,17 +329,24 @@ def calc_position_size(equity: float, atr: float, price: float) -> float:
     return max(qty, 0.0)
 
 
-# ================== 核心循环：每个周期跑一遍所有币种 ==================
+def get_total_notional(db, acc: Account) -> float:
+    """当前所有持仓的总名义价值（按开仓价）"""
+    positions = get_open_positions(db, acc.id)
+    return sum(pos.entry_price * pos.size for pos in positions)
+
+
+# ========== 主循环：每轮跑所有币种 + 杠杆检查 + 强平检查 ==========
 
 def run_cycle_once():
     """
-    核心执行函数：
+    每轮执行：
+      - 先获取当前总名义仓位（用于账户杠杆限制）
       - 对每个 symbol：
-          1) 拉最近一段 K 线
-          2) 用策略生成信号（不改策略逻辑）
-          3) 检查是否已有持仓 -> 判断 SL/TP 是否触发 -> 平仓
-          4) 如空仓且有新信号 -> 计算仓位（含杠杆）-> 加滑点 / 手续费 -> 开仓
-      - 所有 Account / Position / Trade 变化写入数据库
+          1) 拉历史K线
+          2) 用策略生成信号
+          3) 如果有持仓 -> 检查 TP/SL
+          4) 如果空仓 -> 检查账户杠杆 -> 开新仓（含滑点 & 手续费）
+      - 最后跑一次强平检查（equity_mtm vs 维持保证金）
     """
     db = SessionLocal()
     try:
@@ -216,8 +354,8 @@ def run_cycle_once():
         if not acc:
             return
 
-        # 策略参数（目前用默认，你后续可以在这里改 IBS/MIG 等）
         params = PAStrategyParams()
+        total_notional_existing = get_total_notional(db, acc)
 
         for symbol in config.SYMBOLS:
             try:
@@ -229,19 +367,24 @@ def run_cycle_once():
             if df is None or df.empty:
                 continue
 
-            # 策略状态（你后续如果需要在 symbol 之间共享趋势状态，可以提升到循环外）
             state = PAStrategyState()
             sig = generate_signal(df, state, params)
 
             side = sig.get("side")
             atr = sig.get("atr")
             reason = sig.get("reason", "unknown")
+
             last = df.iloc[-1]
             last_price = float(last["close"])
 
-            pos = get_open_position(db, symbol, acc.id)
+            # 当前 symbol 是否已有持仓
+            pos = (
+                db.query(Position)
+                .filter_by(symbol=symbol, account_id=acc.id, closed=0)
+                .first()
+            )
 
-            # 1) 有持仓 -> 判断是否触发 SL / TP
+            # --- 1) 有持仓：检查 TP / SL ---
             if pos and pos.closed == 0:
                 if pos.side == "long":
                     hit_sl = last_price <= pos.stop_loss
@@ -251,37 +394,55 @@ def run_cycle_once():
                     hit_tp = last_price <= pos.take_profit
 
                 if hit_sl or hit_tp:
-                    close_position(db, acc, pos, last_price)
+                    close_position(db, acc, pos, last_price, reason="tp_sl_or_reverse")
 
-                # 有持仓时暂时不考虑反向开新仓，保持模型简单
+                # 有持仓时我们暂时不反向开仓，避免过度复杂
                 continue
 
-            # 2) 无持仓 -> 看是否开新仓
+            # --- 2) 无持仓：看是否开新仓 ---
             if side not in ("long", "short") or atr is None:
                 continue
 
+            # 基于当前账户权益按 ATR 计算目标仓位
             qty = calc_position_size(acc.equity, atr, last_price)
             if qty <= 0:
                 continue
 
-            # === 1. 成交价加入滑点 ===
+            # 用滑点计算预期开仓价格 + 名义价值
             slippage = config.SLIPPAGE_RATE
             if side == "long":
-                # 做多开仓：买得稍微贵一点
                 exec_price = last_price * (1 + slippage)
             else:
-                # 做空开仓：先卖出，价格略高一点
                 exec_price = last_price * (1 - slippage)
 
-            # === 2. 名义价值 & 开仓手续费 ===
-            notional_open = exec_price * qty
+            new_notional = exec_price * qty
+
+            # 帐户层面的总杠杆限制：
+            # (已有总名义 + 新仓位名义) / 市值权益 <= MAX_LEVERAGE
+            # 为简单起见这里用 acc.equity（已实现权益）来估算
+            if acc.equity <= 0:
+                continue
+
+            projected_total_notional = total_notional_existing + new_notional
+            projected_leverage = projected_total_notional / acc.equity
+
+            if projected_leverage > config.MAX_LEVERAGE:
+                # 杠杆上限超标，不开新仓
+                send_telegram(
+                    f"[拒绝开仓][杠杆过高] {symbol} 预期杠杆={projected_leverage:.2f} "
+                    f"上限={config.MAX_LEVERAGE:.2f}"
+                )
+                continue
+
+            # --- 3) 名义合理，正式建仓 ---
+            notional_open = new_notional
             fee_open = notional_open * config.TAKER_FEE_RATE
 
-            # 手续费立刻从权益 / 现金中扣除
+            # 立即扣除开仓手续费
             acc.equity -= fee_open
             acc.cash -= fee_open
 
-            # === 3. 止损止盈（围绕 exec_price） ===
+            # 止损止盈以开仓成交价为中心
             if side == "long":
                 sl = exec_price - atr
                 tp = exec_price + 2 * atr
@@ -301,11 +462,16 @@ def run_cycle_once():
             )
             db.add(pos)
 
+            total_notional_existing += notional_open  # 更新账户总名义
+
             send_telegram(
                 f"[开仓][虚拟盘] {symbol} {side.upper()} size={qty:.4f} "
                 f"价格={exec_price:.2f} ATR={atr:.2f} "
-                f"原因={reason} 手续费={fee_open:.4f}"
+                f"原因={reason} fee_open={fee_open:.4f}"
             )
+
+        # --- 3) 本轮结束后做一次强平检查 ---
+        check_and_liquidate(db, acc)
 
         db.commit()
     finally:
