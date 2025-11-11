@@ -129,18 +129,25 @@ def close_position(db, acc: Account, pos: Position, last_price: float):
 
 def calc_position_size(equity: float, atr: float, price: float) -> float:
     """
-    单笔风控：按 ATR 计算仓位
-    risk_amount = equity * RISK_PER_TRADE_PCT
-    qty ≈ risk_amount / atr
-    名义仓位最多不超过 equity 的 50%
+    合约版仓位计算：
+      - 单笔风险：equity * RISK_PER_TRADE_PCT
+      - ATR 作为止损距离，raw_qty = risk_amount / atr
+      - 杠杆限制：名义价值 notional = price * qty <= equity * MAX_LEVERAGE
     """
-    if atr <= 0 or price <= 0:
+    if atr <= 0 or price <= 0 or equity <= 0:
         return 0.0
+
+    # 单笔风险金额
     risk_amount = equity * (config.RISK_PER_TRADE_PCT / 100.0)
     raw_qty = risk_amount / atr
-    max_notional = equity * 0.5
-    cap_qty = max_notional / price
-    return max(min(raw_qty, cap_qty), 0.0)
+
+    # 杠杆限制：名义仓位上限
+    max_notional_by_lev = equity * config.MAX_LEVERAGE
+    cap_qty_by_lev = max_notional_by_lev / price
+
+    qty = min(raw_qty, cap_qty_by_lev)
+    return max(qty, 0.0)
+
 
 def run_cycle_once():
     """核心循环：对每个币种 拉数据 → 算信号 → 管理仓位"""
