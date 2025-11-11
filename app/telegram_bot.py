@@ -11,6 +11,7 @@ from .trading_engine import (
     get_open_positions,
     set_trading_enabled,
     is_trading_enabled,
+    Trade,  # 新增：导入 Trade 模型
 )
 
 
@@ -22,8 +23,10 @@ async def handle_command(text: str):
       /stop_trading   暂停自动交易
       /stats          查看账户整体情况
       /positions      查看当前持仓列表
+      /history [n]    查看最近 n 笔成交（默认 10，最多 50）
     """
-    cmd = (text or "").strip().lower()
+    cmd_raw = (text or "").strip()
+    cmd = cmd_raw.lower()
 
     if cmd in ("/start", "/help"):
         msg = (
@@ -32,6 +35,7 @@ async def handle_command(text: str):
             "/stop_trading  - 暂停自动交易\n"
             "/stats         - 查看账户资金 & 杠杆情况\n"
             "/positions     - 查看当前持仓\n"
+            "/history [n]   - 查看最近 n 笔成交（默认10，最多50）\n"
         )
         await send_telegram_async(msg)
         return
@@ -46,7 +50,7 @@ async def handle_command(text: str):
         await send_telegram_async("⏸ 已暂停自动交易（不再开新仓，已有持仓仍会走到平仓逻辑）。")
         return
 
-    if cmd == "/stats":
+    if cmd.startswith("/stats"):
         db = SessionLocal()
         try:
             acc = get_account(db)
@@ -73,7 +77,7 @@ async def handle_command(text: str):
             db.close()
         return
 
-    if cmd == "/positions":
+    if cmd.startswith("/positions"):
         db = SessionLocal()
         try:
             acc = get_account(db)
@@ -95,6 +99,58 @@ async def handle_command(text: str):
                     f"  IM={im:.2f} MM={mm:.2f} 爆仓价≈{liq:.2f}\n"
                     f"  SL={pos.stop_loss:.2f} TP={pos.take_profit:.2f}"
                 )
+            await send_telegram_async("\n".join(lines))
+        finally:
+            db.close()
+        return
+
+    if cmd.startswith("/history"):
+        # 解析 /history 后面跟的数字，例如 "/history 20"
+        parts = cmd_raw.split()
+        limit = 10
+        if len(parts) >= 2:
+            try:
+                limit = int(parts[1])
+            except ValueError:
+                limit = 10
+        limit = max(1, min(limit, 50))  # 至少1，最多50
+
+        db = SessionLocal()
+        try:
+            acc = get_account(db)
+            if not acc:
+                await send_telegram_async("账户不存在。")
+                return
+
+            # 最近成交，按平仓时间倒序
+            trades = (
+                db.query(Trade)
+                .filter_by(account_id=acc.id)
+                .order_by(Trade.closed_at.desc())
+                .limit(limit)
+                .all()
+            )
+
+            if not trades:
+                await send_telegram_async("暂无成交记录。")
+                return
+
+            lines = [f"📜 最近 {len(trades)} 笔成交："]
+            total_pnl = 0.0
+
+            for t in trades:
+                total_pnl += t.pnl
+                emoji = "🟢" if t.pnl > 0 else "🔴" if t.pnl < 0 else "⚪"
+                opened = t.opened_at.strftime("%m-%d %H:%M") if t.opened_at else "?"
+                closed = t.closed_at.strftime("%m-%d %H:%M") if t.closed_at else "?"
+                lines.append(
+                    f"{emoji} {t.symbol} {t.side.upper()} size={t.size:.4f}\n"
+                    f"  入场={t.entry_price:.2f} 平仓={t.exit_price:.2f}\n"
+                    f"  PnL={t.pnl:+.2f}  原因={t.reason}\n"
+                    f"  开始={opened}  结束={closed}"
+                )
+
+            lines.append(f"\n合计PnL（这 {len(trades)} 笔）：{total_pnl:+.2f} USDT")
             await send_telegram_async("\n".join(lines))
         finally:
             db.close()
