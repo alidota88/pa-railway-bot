@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+httpx
+ccxt
+pandas
+SQLAlchemy
+psycopg2-binary
+anyio
