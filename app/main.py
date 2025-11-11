@@ -10,6 +10,8 @@ from .trading_engine import (
     compute_account_margin_and_unrealized,
     compute_position_margin_and_liq,
 )
+from .telegram_bot import telegram_command_loop
+
 
 app = FastAPI()
 
