@@ -17,10 +17,12 @@ async def startup_event():
     asyncio.create_task(worker_loop())
 
 async def worker_loop():
-    # 每 60 秒运行一次策略
+    import datetime
     while True:
+        print(f"[{datetime.datetime.utcnow()}] Worker loop running...")
         try:
             run_cycle_once()
         except Exception as e:
             print("Worker error:", e)
         await asyncio.sleep(60)
+
