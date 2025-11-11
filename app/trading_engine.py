@@ -19,6 +19,18 @@ from . import config
 from .telegram_client import send_telegram
 from .strategy_pa import PAStrategyState, generate_signal, PAStrategyParams
 
+# ========== 交易开关（由 Telegram 控制） ==========
+
+TRADING_ENABLED: bool = True  # 默认开启自动交易
+
+def set_trading_enabled(value: bool):
+    global TRADING_ENABLED
+    TRADING_ENABLED = bool(value)
+
+def is_trading_enabled() -> bool:
+    return TRADING_ENABLED
+
+
 
 # ========== 风险 & 保证金参数 ==========
 
@@ -386,6 +398,10 @@ def run_cycle_once():
     """
     db = SessionLocal()
     try:
+        # 如果被 Telegram 指令暂停，则本轮什么都不做
+        if not is_trading_enabled():
+            return
+
         acc = get_account(db)
         if not acc:
             return
