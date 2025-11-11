@@ -386,6 +386,28 @@ def get_total_notional(db, acc: Account) -> float:
     positions = get_open_positions(db, acc.id)
     return sum(pos.entry_price * pos.size for pos in positions)
 
+def reset_account_state(db):
+    """
+    重置虚拟账户：
+      - 删除该账户下所有持仓 Position
+      - 删除所有成交记录 Trade
+      - 把权益 equity / cash 复位为 START_EQUITY
+    """
+    acc = get_account(db)
+    if not acc:
+        return None
+
+    # 删掉该账户所有持仓 & 成交
+    db.query(Position).filter_by(account_id=acc.id).delete()
+    db.query(Trade).filter_by(account_id=acc.id).delete()
+
+    # 账户资金重置
+    acc.equity = config.START_EQUITY
+    acc.cash = config.START_EQUITY
+    db.add(acc)
+
+    return acc
+
 
 # ========== 主循环：每轮跑所有币种 + 杠杆检查 + 强平检查 ==========
 
