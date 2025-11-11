@@ -199,24 +199,36 @@ def run_cycle_once():
                 if qty <= 0:
                     continue
 
-                if side == "short":
-                    # 虚拟合约做空，资金模型简单化：只用权益控制风险
-                    pass
-
-                # 建仓
-                # 止损：1 * ATR，止盈：2 * ATR
+                # === 1. 计算有滑点的成交价 ===
+                slippage = config.SLIPPAGE_RATE
                 if side == "long":
-                    sl = last_price - atr
-                    tp = last_price + 2 * atr
+                    # 做多开仓：买入，价格稍微高一点
+                    exec_price = last_price * (1 + slippage)
                 else:
-                    sl = last_price + atr
-                    tp = last_price - 2 * atr
+                    # 做空开仓：先卖出，价格略高（对我们更有利）
+                    exec_price = last_price * (1 - slippage)
+
+                # === 2. 名义价值 & 开仓手续费 ===
+                notional_open = exec_price * qty
+                fee_open = notional_open * config.TAKER_FEE_RATE
+
+                # 手续费立刻从权益 / 现金中扣除（更接近真实）
+                acc.equity -= fee_open
+                acc.cash -= fee_open
+
+                # === 3. 设置止损止盈（用成交价 exec_price 为中心更合理） ===
+                if side == "long":
+                    sl = exec_price - atr
+                    tp = exec_price + 2 * atr
+                else:
+                    sl = exec_price + atr
+                    tp = exec_price - 2 * atr
 
                 pos = Position(
                     symbol=symbol,
                     side=side,
                     size=qty,
-                    entry_price=last_price,
+                    entry_price=exec_price,
                     atr=atr,
                     stop_loss=sl,
                     take_profit=tp,
@@ -226,7 +238,7 @@ def run_cycle_once():
 
                 send_telegram(
                     f"[开仓][虚拟盘] {symbol} {side.upper()} size={qty:.4f} "
-                    f"价格={last_price:.2f} ATR={atr:.2f}"
+                    f"价格={exec_price:.2f} ATR={atr:.2f} 手续费={fee_open:.4f}"
                 )
 
         db.commit()
