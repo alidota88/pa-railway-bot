@@ -12,6 +12,7 @@ from .trading_engine import (
     set_trading_enabled,
     is_trading_enabled,
     Trade,  # 新增：导入 Trade 模型
+    reset_account_state,
 )
 
 
@@ -36,6 +37,7 @@ async def handle_command(text: str):
             "/stats         - 查看账户资金 & 杠杆情况\n"
             "/positions     - 查看当前持仓\n"
             "/history [n]   - 查看最近 n 笔成交（默认10，最多50）\n"
+            "/reset_account - 清空所有持仓和历史成交，账户资金重置\n"
         )
         await send_telegram_async(msg)
         return
@@ -104,6 +106,34 @@ async def handle_command(text: str):
             db.close()
         return
 
+    if cmd == "/reset_account":
+        # 为安全起见，先暂停交易
+        set_trading_enabled(False)
+
+        db = SessionLocal()
+        try:
+            acc = get_account(db)
+            if not acc:
+                await send_telegram_async("账户不存在，无法重置。")
+                return
+
+            old_equity = acc.equity
+
+            acc = reset_account_state(db)
+            db.commit()
+
+            await send_telegram_async(
+                "⚠️ 已执行账户重置：\n"
+                f"- 重置前 Equity：{old_equity:.2f}\n"
+                f"- 重置后 Equity：{acc.equity:.2f}\n"
+                f"- 所有持仓 & 历史成交已清空。\n\n"
+                "如需继续自动交易，请发送 /start_trading 重新开启。"
+            )
+        finally:
+            db.close()
+        return
+
+    
     if cmd.startswith("/history"):
         # 解析 /history 后面跟的数字，例如 "/history 20"
         parts = cmd_raw.split()
