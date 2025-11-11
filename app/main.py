@@ -84,6 +84,9 @@ async def startup_event():
     init_db_and_account()
     # 启动后台策略循环
     asyncio.create_task(worker_loop())
+    # 启动 Telegram 命令监听循环
+    asyncio.create_task(telegram_command_loop())
+
 
 
 async def worker_loop():
