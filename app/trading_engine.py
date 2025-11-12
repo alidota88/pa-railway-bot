@@ -564,3 +564,121 @@ def run_cycle_once():
         db.commit()
     finally:
         db.close()
+
+async def run_signal_once(symbol: str, df: pd.DataFrame, sig: dict):
+    """
+    由 WebSocket 调用：对单个 symbol 的已收盘K线执行一次策略处理。
+    输入：
+      - symbol: 形如 "BTC/USDT"
+      - df:     包含至少 [ts, open, high, low, close, volume] 且按时间升序
+      - sig:    generate_signal() 的输出，含 side/atr/reason
+    步骤：
+      1) 如果当前有持仓 -> 检查TP/SL，触发则平仓
+      2) 如果空仓且有信号 -> 计算仓位、杠杆检查、开仓
+      3) 末尾做一次强平检查
+    """
+    # 如果被暂停交易，直接返回
+    if not is_trading_enabled():
+        return
+
+    db = SessionLocal()
+    try:
+        acc = get_account(db)
+        if not acc:
+            return
+
+        # 最新价格
+        last = df.iloc[-1]
+        last_price = float(last["close"])
+
+        side = sig.get("side")
+        atr = sig.get("atr")
+        reason = sig.get("reason", "unknown")
+
+        # 查询是否已有未平仓
+        pos = (
+            db.query(Position)
+            .filter_by(symbol=symbol, account_id=acc.id, closed=0)
+            .first()
+        )
+
+        # 1) 有持仓：检查TP/SL
+        if pos and pos.closed == 0:
+            if pos.side == "long":
+                hit_sl = last_price <= pos.stop_loss
+                hit_tp = last_price >= pos.take_profit
+            else:
+                hit_sl = last_price >= pos.stop_loss
+                hit_tp = last_price <= pos.take_profit
+
+            if hit_sl or hit_tp:
+                close_position(db, acc, pos, last_price, reason="tp_sl_or_reverse")
+                db.commit()
+                # 强平检查（尽量每次变动后检查）
+                check_and_liquidate(db, acc)
+            return
+
+        # 2) 无持仓：尝试根据信号开新仓
+        if side not in ("long", "short") or atr is None:
+            return
+
+        # 账户现有总名义（用于杠杆上限检查）
+        total_notional_existing = get_total_notional(db, acc)
+
+        # 基于 ATR 计算目标仓位
+        qty = calc_position_size(acc.equity, atr, last_price)
+        if qty <= 0:
+            return
+
+        # 成交价 + 名义 + 手续费（含滑点）
+        exec_price = last_price * (1 + SLIPPAGE_RATE) if side == "long" else last_price * (1 - SLIPPAGE_RATE)
+        notional_open = exec_price * qty
+        fee_open = notional_open * TAKER_FEE_RATE
+
+        # 杠杆上限检查
+        if (total_notional_existing + notional_open) > acc.equity * MAX_LEVERAGE:
+            send_telegram(f"⛔ 杠杆上限：拒绝开仓 {symbol} {side.upper()} 名义={notional_open:.2f}")
+            return
+
+        # 扣费、落持仓
+        acc.equity -= fee_open
+        if side == "long":
+            sl = exec_price - atr
+            tp = exec_price + 2 * atr
+        else:
+            sl = exec_price + atr
+            tp = exec_price - 2 * atr
+
+        new_pos = Position(
+            symbol=symbol,
+            side=side,
+            size=qty,
+            entry_price=exec_price,
+            atr=atr,
+            stop_loss=sl,
+            take_profit=tp,
+            account_id=acc.id,
+        )
+        db.add(new_pos)
+
+        # 推送
+        emoji = "📈" if side == "long" else "📉"
+        msg = (
+            f"{emoji} 开仓：{symbol} {side.upper()}\n"
+            f"数量：{qty:.4f}\n"
+            f"价格：{exec_price:.2f} USDT\n"
+            f"止损：{sl:.2f}  止盈：{tp:.2f}\n"
+            f"ATR：{atr:.2f}  手续费：{fee_open:.2f}\n"
+            f"信号来源：{reason}"
+        )
+        send_telegram(msg)
+
+        # 账户快照
+        send_account_snapshot(db, acc, prefix=f"[开仓后账户] {symbol}")
+
+        # 3) 强平检查 & 提交
+        check_and_liquidate(db, acc)
+        db.commit()
+
+    finally:
+        db.close()
