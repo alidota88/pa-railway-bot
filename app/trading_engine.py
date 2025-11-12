@@ -334,4 +334,8 @@ def get_account_snapshot() -> Dict:
             "mark": mark,
             "unrealized_pnl": unreal,
             "updated_ts": p.updated_ts
-        }
+        })  # ←←← 注意这两个闭合符号！
+    return {
+        "equity": ACCOUNT.equity,
+        "positions": snap_pos
+    }
