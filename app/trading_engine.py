@@ -1,684 +1,337 @@
+# app/trading_engine.py
 from __future__ import annotations
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple, List
 
-from datetime import datetime
-from typing import Optional, Dict, Tuple, List
-
-import ccxt
-import pandas as pd
-from sqlalchemy import (
-    create_engine,
-    Column,
-    Integer,
-    String,
-    Float,
-    DateTime,
-)
-from sqlalchemy.orm import sessionmaker, declarative_base
-
-from . import config
-from .telegram_client import send_telegram
-from .strategy_pa import PAStrategyState, generate_signal, PAStrategyParams
-
-# ========== 交易开关（由 Telegram 控制） ==========
-
-TRADING_ENABLED: bool = True  # 默认开启自动交易
-
-def set_trading_enabled(value: bool):
-    global TRADING_ENABLED
-    TRADING_ENABLED = bool(value)
-
-def is_trading_enabled() -> bool:
-    return TRADING_ENABLED
-
-
-
-# ========== 风险 & 保证金参数 ==========
-
-# 维持保证金率（比如 0.005 = 0.5%）
-MAINTENANCE_MARGIN_RATE: float = getattr(config, "MAINTENANCE_MARGIN_RATE", 0.005)
-
-
-# ========== 数据库初始化 ==========
-
-if not config.DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set. Please configure it in Railway env vars.")
-
-engine = create_engine(config.DATABASE_URL, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
-Base = declarative_base()
-
-
-# ========== ORM 模型 ==========
-
-class Account(Base):
-    __tablename__ = "accounts"
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, unique=True, index=True)
-    equity = Column(Float, default=0)  # 当前总权益（已实现盈亏 + 手续费）
-    cash = Column(Float, default=0)    # 简化模型下的“现金”
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-
-class Position(Base):
-    __tablename__ = "positions"
-    id = Column(Integer, primary_key=True, index=True)
-    symbol = Column(String, index=True)
-    side = Column(String)             # "long" / "short"
-    size = Column(Float)              # 仓位数量（正数）
-    entry_price = Column(Float)
-    atr = Column(Float)
-    stop_loss = Column(Float)
-    take_profit = Column(Float)
-    opened_at = Column(DateTime, default=datetime.utcnow)
-    closed = Column(Integer, default=0)  # 0=持仓中, 1=已平仓
-    account_id = Column(Integer)
-
-
-class Trade(Base):
-    __tablename__ = "trades"
-    id = Column(Integer, primary_key=True, index=True)
-    symbol = Column(String, index=True)
-    side = Column(String)              # "long" / "short"
-    size = Column(Float)
-    entry_price = Column(Float)
-    exit_price = Column(Float)
-    pnl = Column(Float)                # 净利润（含手续费）
-    opened_at = Column(DateTime)
-    closed_at = Column(DateTime)
-    reason = Column(String)            # "tp_sl_or_reverse" / "liquidation" 等
-    account_id = Column(Integer)
-
-
-def init_db_and_account():
-    """建表 + 初始化虚拟账户"""
-    Base.metadata.create_all(bind=engine)
-    db = SessionLocal()
+# ------------ 配置读取（与 config.py 对齐）------------
+def _getenv_float(k: str, default: float) -> float:
     try:
-        acc = db.query(Account).filter_by(name="paper").first()
-        if not acc:
-            acc = Account(
-                name="paper",
-                equity=config.START_EQUITY,
-                cash=config.START_EQUITY,
-            )
-            db.add(acc)
-            db.commit()
-    finally:
-        db.close()
+        return float(os.getenv(k, str(default)))
+    except Exception:
+        return default
 
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+USE_BINANCE_FUTURES = os.getenv("USE_BINANCE_FUTURES", "0") == "1"
 
-# ========== 行情交易所 ==========
+SLIPPAGE_MODEL = os.getenv("SLIPPAGE_MODEL", "impact")  # fixed / spread / impact
+SLIPPAGE_RATE = _getenv_float("SLIPPAGE_RATE", 0.0005)
+MIN_SPREAD_SLIPPAGE = _getenv_float("MIN_SPREAD_SLIPPAGE", 0.0001)
+IMPACT_TOP_LEVELS = int(os.getenv("IMPACT_TOP_LEVELS", "10"))
+IMPACT_COEF = _getenv_float("IMPACT_COEF", 0.7)
 
-exchange = getattr(ccxt, config.EXCHANGE_ID)()
+TAKER_FEE_RATE = _getenv_float("TAKER_FEE_RATE", 0.0005)
+MAX_LEVERAGE = _getenv_float("MAX_LEVERAGE", 1.0)
+RISK_PER_TRADE_PCT = _getenv_float("RISK_PER_TRADE_PCT", 0.01)
+START_EQUITY = _getenv_float("START_EQUITY", 10000.0)
 
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT").split(",") if s.strip()]
+TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 
-def fetch_ohlcv_df(symbol: str, limit: int = 200) -> pd.DataFrame:
-    """
-    从交易所拉 OHLCV，并转为 DataFrame：
-      ts, open, high, low, close, volume
-    """
-    ohlcv = exchange.fetch_ohlcv(symbol, config.TIMEFRAME, limit=limit)
-    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    return df
+# ------------ 可选依赖（都失败不影响主流程）------------
+_ccxt = None
+try:
+    import ccxt  # type: ignore
+    _ccxt = getattr(ccxt, "binance")()
+except Exception:
+    _ccxt = None
 
+_binance_client = None
+try:
+    from binance import Client  # type: ignore
+    _binance_client = Client(api_key=BINANCE_API_KEY or None,
+                             api_secret=BINANCE_API_SECRET or None)
+except Exception:
+    _binance_client = None
 
-# ========== 帐户 & 持仓工具函数 ==========
+# 如果用户已经按之前建议创建了 exchange_client / slippage，这里优先使用
+_use_external_exchange = False
+_use_external_slippage = False
+try:
+    from .exchange_client import get_best_bid_ask as ext_get_best_bid_ask, \
+        get_orderbook_levels as ext_get_orderbook_levels, get_mid_price as ext_get_mid_price, ccxt_exchange as ext_ccxt_exchange
+    _use_external_exchange = True
+except Exception:
+    pass
 
-def get_account(db) -> Account:
-    return db.query(Account).filter_by(name="paper").first()
+try:
+    from .slippage import compute_exec_price as ext_compute_exec_price
+    _use_external_slippage = True
+except Exception:
+    pass
 
+# ------------ 工具函数：符号转换 ------------
+def _to_binance_symbol(sym: str) -> str:
+    return sym.replace("/", "")
 
-def get_open_positions(db, acc_id: int) -> List[Position]:
-    return db.query(Position).filter_by(account_id=acc_id, closed=0).all()
+# ------------ 盘口/价格读取 ------------
+def get_best_bid_ask(symbol: str) -> Tuple[float, float]:
+    """优先用外部 exchange_client，其次 python-binance，失败抛异常。"""
+    if _use_external_exchange:
+        return ext_get_best_bid_ask(symbol)
+    if _binance_client is None:
+        raise RuntimeError("binance client unavailable")
+    data = _binance_client.get_orderbook_ticker(symbol=_to_binance_symbol(symbol))
+    return float(data["bidPrice"]), float(data["askPrice"])
 
+def get_orderbook_levels(symbol: str, limit: int = IMPACT_TOP_LEVELS) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    if _use_external_exchange:
+        return ext_get_orderbook_levels(symbol, limit=limit)
+    if _binance_client is None:
+        raise RuntimeError("binance client unavailable")
+    depth = _binance_client.get_order_book(symbol=_to_binance_symbol(symbol), limit=limit)
+    bids = [(float(p), float(q)) for p, q in depth["bids"]]
+    asks = [(float(p), float(q)) for p, q in depth["asks"]]
+    return bids, asks
 
-# ========== 单个持仓的保证金 & 爆仓价计算 ==========
-
-def compute_position_margin_and_liq(pos: Position) -> Tuple[float, float, float, float]:
-    """
-    返回：
-      notional        名义价值 = entry_price * size
-      initial_margin  初始保证金 = notional / MAX_LEVERAGE
-      maint_margin    维持保证金 = notional * MAINTENANCE_MARGIN_RATE
-      liq_price       简化版爆仓价（按 isolated 模型推导）
-    """
-    notional = pos.entry_price * pos.size
-    lev = config.MAX_LEVERAGE
-
-    initial_margin = notional / lev
-    maint_margin = notional * MAINTENANCE_MARGIN_RATE
-
-    # 简化公式：
-    # 对多头：IM + (P_liq - entry) * size = MM
-    # 对空头：IM + (entry - P_liq) * size = MM
-    if pos.side == "long":
-        liq_price = pos.entry_price + (maint_margin - initial_margin) / pos.size
-    else:
-        liq_price = pos.entry_price - (maint_margin - initial_margin) / pos.size
-
-    return notional, initial_margin, maint_margin, liq_price
-
-
-# ========== 全账户：保证金 / 杠杆 / 未实现盈亏 统计 ==========
-
-def compute_account_margin_and_unrealized(
-    db,
-    acc: Account,
-):
-    """
-    返回：
-      stats: {
-        total_notional,
-        used_margin,
-        maint_margin_total,
-        total_unrealized,
-        equity_mtm,
-        free_margin,
-        account_leverage
-      }
-      price_map: { symbol: last_price }
-      positions: 当前所有未平仓持仓列表
-    """
-    positions = get_open_positions(db, acc.id)
-    total_notional = 0.0
-    used_margin = 0.0
-    maint_margin_total = 0.0
-    total_unrealized = 0.0
-    price_map: Dict[str, float] = {}
-
-    for pos in positions:
-        # 为了更真实，单独拉该 symbol 最新一根 K
+def get_mid_price(symbol: str, fallback_last: Optional[float] = None) -> float:
+    if _use_external_exchange:
         try:
-            df = fetch_ohlcv_df(pos.symbol, limit=1)
-            last_price = float(df.iloc[-1]["close"])
+            return ext_get_mid_price(symbol)
         except Exception:
-            # 拉失败就退化为用 entry_price
-            last_price = float(pos.entry_price)
+            pass
+    # 先 bookTicker
+    if _binance_client:
+        try:
+            bid, ask = get_best_bid_ask(symbol)
+            return (bid + ask) / 2.0
+        except Exception:
+            pass
+    # 再 ccxt
+    if _ccxt:
+        try:
+            t = _ccxt.fetch_ticker(symbol)
+            return float(t["last"])
+        except Exception:
+            pass
+    # 兜底
+    if fallback_last is not None:
+        return float(fallback_last)
+    raise RuntimeError(f"cannot fetch mid price for {symbol}")
 
-        price_map[pos.symbol] = last_price
+# ------------ 滑点计算 ------------
+def compute_exec_price(symbol: str, side: str, qty: float, last_price: float) -> float:
+    """side: 'long'/'short'"""
+    if _use_external_slippage:
+        # 如果用户已经有 slippage.py，就直接调用
+        try:
+            return ext_compute_exec_price(symbol, side, qty, last_price)
+        except Exception:
+            pass
 
-        notional, im, mm, _ = compute_position_margin_and_liq(pos)
-        total_notional += notional
-        used_margin += im
-        maint_margin_total += mm
+    # 内置逻辑
+    model = SLIPPAGE_MODEL.lower()
+    if model == "fixed":
+        rate = SLIPPAGE_RATE
+        return last_price * (1 + rate) if side == "long" else last_price * (1 - rate)
 
-        # 未实现盈亏（mark-to-market）
-        if pos.side == "long":
-            total_unrealized += (last_price - pos.entry_price) * pos.size
-        else:
-            total_unrealized += (pos.entry_price - last_price) * pos.size
-
-    # 按市值计的账户权益
-    equity_mtm = acc.equity + total_unrealized
-    free_margin = equity_mtm - used_margin
-    account_leverage = total_notional / equity_mtm if equity_mtm > 0 else float("inf")
-
-    stats = dict(
-        total_notional=total_notional,
-        used_margin=used_margin,
-        maint_margin_total=maint_margin_total,
-        total_unrealized=total_unrealized,
-        equity_mtm=equity_mtm,
-        free_margin=free_margin,
-        account_leverage=account_leverage,
-    )
-    return stats, price_map, positions
-
-
-# ========== 账户快照推送到 Telegram ==========
-
-def send_account_snapshot(db, acc: Account, prefix: str = "[账户快照]"):
-    """
-    将当前账户整体情况推送到 Telegram：
-      - 实现权益 equity
-      - 按市值计的权益 equity_mtm
-      - 已用保证金 / 可用保证金
-      - 总名义仓位 / 杠杆
-      - 当前持仓数量
-    """
+    # spread/impact 需要盘口
     try:
-        stats, _, positions = compute_account_margin_and_unrealized(db, acc)
-    except Exception as e:
-        print("send_account_snapshot error:", repr(e))
-        return
+        bid, ask = get_best_bid_ask(symbol)
+        mid = (bid + ask) / 2.0
+        half_spread = max(((ask - bid) / 2.0) / mid, MIN_SPREAD_SLIPPAGE)
 
-    text = (
-        f"{prefix}\n"
-        f"💰 Equity(已实现)：{acc.equity:.2f}\n"
-        f"📈 Equity(MtM)：{stats['equity_mtm']:.2f}\n"
-        f"💼 名义仓位总额：{stats['total_notional']:.2f}\n"
-        f"🔒 已用保证金(IM)：{stats['used_margin']:.2f}\n"
-        f"⚙️ 维持保证金(MM)：{stats['maint_margin_total']:.2f}\n"
-        f"💵 可用保证金：{stats['free_margin']:.2f}\n"
-        f"📊 当前杠杆：{stats['account_leverage']:.2f}x\n"
-        f"📌 持仓数：{len(positions)}"
-    )
+        if model == "spread":
+            return mid * (1 + half_spread) if side == "long" else mid * (1 - half_spread)
 
-    send_telegram(text)
+        if model == "impact":
+            bids, asks = get_orderbook_levels(symbol, limit=IMPACT_TOP_LEVELS)
+            depth_qty = sum(q for _, q in (asks if side == "long" else bids))
+            if depth_qty <= 0:
+                impact = SLIPPAGE_RATE
+            else:
+                impact = min(0.01, (qty / depth_qty) * IMPACT_COEF)
+            total_shift = half_spread + impact
+            return mid * (1 + total_shift) if side == "long" else mid * (1 - total_shift)
 
+        # 未知模型 -> fixed
+        return last_price * (1 + SLIPPAGE_RATE) if side == "long" else last_price * (1 - SLIPPAGE_RATE)
+    except Exception:
+        # 盘口失败 -> fixed
+        return last_price * (1 + SLIPPAGE_RATE) if side == "long" else last_price * (1 - SLIPPAGE_RATE)
 
-# ========== 平仓逻辑（含滑点 & 手续费 & 原因） ==========
+# ------------ 纸质账户与仓位（示例实现，可换成你的持久化）------------
+@dataclass
+class Position:
+    symbol: str
+    side: str             # 'long' or 'short'
+    size: float = 0.0
+    avg_price: float = 0.0
+    unrealized_pnl: float = 0.0
+    updated_ts: float = field(default_factory=time.time)
 
-def close_position(
-    db,
-    acc: Account,
-    pos: Position,
-    last_price: float,
-    reason: str = "tp_sl_or_reverse",
-):
-    """
-    平仓：
-      - 根据方向加滑点得到 exec_price_close
-      - 计算毛利润 pnl_gross
-      - 计算平仓手续费 fee_close
-      - 净利润 pnl_net = pnl_gross - fee_close
-      - 更新账户权益 & 记录 Trade
-      - 推送平仓信息 + 平仓后账户快照
-    """
-    slippage = config.SLIPPAGE_RATE
+@dataclass
+class Account:
+    equity: float = START_EQUITY
+    positions: Dict[str, Position] = field(default_factory=dict)
 
+ACCOUNT = Account()
+
+def _position_value(pos: Position, mark: float) -> float:
     if pos.side == "long":
-        # 多单平仓：卖出，价格略低
-        exec_price_close = last_price * (1 - slippage)
-        pnl_gross = (exec_price_close - pos.entry_price) * pos.size
+        return pos.size * mark
     else:
-        # 空单平仓：买入，价格略高
-        exec_price_close = last_price * (1 + slippage)
-        pnl_gross = (pos.entry_price - exec_price_close) * pos.size
+        # 简化：做空名义价值
+        return pos.size * (2 * pos.avg_price - mark)
 
-    notional_close = exec_price_close * pos.size
-    fee_close = notional_close * config.TAKER_FEE_RATE
+# ------------ 风险控制 ------------
+def _check_leverage_ok(symbol: str, new_notional: float) -> bool:
+    # 简化：全仓权益 / 总名义 <= MAX_LEVERAGE
+    total_notional = sum(abs(p.size * p.avg_price) for p in ACCOUNT.positions.values())
+    after = total_notional + abs(new_notional)
+    if MAX_LEVERAGE <= 0:
+        return True
+    return (after / max(ACCOUNT.equity, 1e-9)) <= MAX_LEVERAGE
 
-    pnl_net = pnl_gross - fee_close
-
-    acc.equity += pnl_net
-    acc.cash += pnl_net
-
-    trade = Trade(
-        symbol=pos.symbol,
-        side=pos.side,
-        size=pos.size,
-        entry_price=pos.entry_price,
-        exit_price=exec_price_close,
-        pnl=pnl_net,
-        opened_at=pos.opened_at,
-        closed_at=datetime.utcnow(),
-        account_id=acc.id,
-        reason=reason,
-    )
-    pos.closed = 1
-    db.add(trade)
-    db.add(acc)
-    db.add(pos)
-
-    pnl_symbol = "🟢" if pnl_net > 0 else "🔴"
-    msg = (
-        f"{pnl_symbol} 平仓：{pos.symbol} {pos.side.upper()}\n"
-        f"数量：{pos.size:.4f}\n"
-        f"入场：{pos.entry_price:.2f}  平仓：{exec_price_close:.2f}\n"
-        f"净收益：{pnl_net:+.2f} USDT  (fee={fee_close:.2f})\n"
-        f"原因：{reason}"
-    )
-    send_telegram(msg)
-
-
-    # 平仓后发一条账户快照
-    send_account_snapshot(db, acc, prefix=f"[平仓后账户] {pos.symbol}")
-
-
-# ========== 强平逻辑：权益跌到维持保证金水平自动全平 ==========
-
-def check_and_liquidate(db, acc: Account):
+# ------------ 纸质撮合 ------------
+def paper_execute_order(symbol: str, side: str, qty: float, last_price: Optional[float] = None) -> Dict:
     """
-    计算市值权益 equity_mtm 和总维持保证金 maint_margin_total：
-      - 如果 equity_mtm <= maint_margin_total，则触发强平：
-        以当前市价（含滑点）一次性平掉所有持仓。
+    返回执行细节：{symbol, side, qty, exec_price, fee, pnl_delta, equity}
+    side: 'buy'/'sell' 或 'long'/'short'
     """
-    stats, price_map, positions = compute_account_margin_and_unrealized(db, acc)
+    side = "long" if side in ("buy", "long") else "short"
+    mark = get_mid_price(symbol, fallback_last=last_price or 0.0)
+    exec_price = compute_exec_price(symbol, side, qty, mark)
 
-    equity_mtm = stats["equity_mtm"]
-    maint_margin_total = stats["maint_margin_total"]
+    notional = qty * exec_price
+    if not _check_leverage_ok(symbol, notional):
+        return {"status": "rejected/leverage", "symbol": symbol, "side": side, "qty": qty}
 
-    if not positions:
-        return
+    fee = notional * TAKER_FEE_RATE
 
-    if equity_mtm <= maint_margin_total:
-        send_telegram(
-            f"[强平触发] equity_mtm={equity_mtm:.2f}, "
-            f"maint_margin_total={maint_margin_total:.2f}, "
-            f"positions={len(positions)}"
-        )
+    pos = ACCOUNT.positions.get(symbol)
+    if pos is None:
+        pos = Position(symbol=symbol, side=side, size=0.0, avg_price=0.0)
+        ACCOUNT.positions[symbol] = pos
 
-        for pos in positions:
-            last_price = price_map.get(pos.symbol, pos.entry_price)
-            close_position(db, acc, pos, last_price, reason="liquidation")
-
-        # 强平后再发一次整体账户快照
-        send_account_snapshot(db, acc, prefix="[强平完成后账户]")
-
-
-# ========== 仓位大小：ATR + 单笔风险 + 杠杆限制 ==========
-
-def calc_position_size(equity: float, atr: float, price: float) -> float:
-    """
-    合约版仓位计算：
-      - 单笔风险单元：equity * RISK_PER_TRADE_PCT
-      - ATR 作为止损距离，raw_qty = risk_amount / atr
-      - 杠杆限制：notional <= equity * MAX_LEVERAGE
-    """
-    if atr <= 0 or price <= 0 or equity <= 0:
-        return 0.0
-
-    risk_amount = equity * (config.RISK_PER_TRADE_PCT / 100.0)
-    raw_qty = risk_amount / atr
-
-    # 单笔仓位名义价值的最大上限（不超过账户可用杠杆）
-    max_notional_by_lev = equity * config.MAX_LEVERAGE
-    cap_qty_by_lev = max_notional_by_lev / price
-
-    qty = min(raw_qty, cap_qty_by_lev)
-    return max(qty, 0.0)
-
-
-def get_total_notional(db, acc: Account) -> float:
-    """当前所有持仓的总名义价值（按开仓价）"""
-    positions = get_open_positions(db, acc.id)
-    return sum(pos.entry_price * pos.size for pos in positions)
-
-def reset_account_state(db):
-    """
-    重置虚拟账户：
-      - 删除该账户下所有持仓 Position
-      - 删除所有成交记录 Trade
-      - 把权益 equity / cash 复位为 START_EQUITY
-    """
-    acc = get_account(db)
-    if not acc:
-        return None
-
-    # 删掉该账户所有持仓 & 成交
-    db.query(Position).filter_by(account_id=acc.id).delete()
-    db.query(Trade).filter_by(account_id=acc.id).delete()
-
-    # 账户资金重置
-    acc.equity = config.START_EQUITY
-    acc.cash = config.START_EQUITY
-    db.add(acc)
-
-    return acc
-
-
-# ========== 主循环：每轮跑所有币种 + 杠杆检查 + 强平检查 ==========
-
-def run_cycle_once():
-    """
-    每轮执行：
-      - 先获取当前总名义仓位（用于账户杠杆限制）
-      - 对每个 symbol：
-          1) 拉历史K线
-          2) 用策略生成信号
-          3) 如果有持仓 -> 检查 TP/SL
-          4) 如果空仓 -> 检查账户杠杆 -> 开新仓（含滑点 & 手续费）
-             → 每次开仓后推送一条账户快照
-      - 最后跑一次强平检查（equity_mtm vs 维持保证金）
-    """
-    db = SessionLocal()
-    try:
-        # 如果被 Telegram 指令暂停，则本轮什么都不做
-        if not is_trading_enabled():
-            return
-
-        acc = get_account(db)
-        if not acc:
-            return
-
-        params = PAStrategyParams()
-        total_notional_existing = get_total_notional(db, acc)
-
-        for symbol in config.SYMBOLS:
-            try:
-                df = fetch_ohlcv_df(symbol)
-            except Exception as e:
-                print(f"fetch_ohlcv error for {symbol}:", repr(e))
-                continue
-
-            if df is None or df.empty:
-                continue
-
-            state = PAStrategyState()
-            sig = generate_signal(df, state, params)
-
-            side = sig.get("side")
-            atr = sig.get("atr")
-            reason = sig.get("reason", "unknown")
-
-            last = df.iloc[-1]
-            last_price = float(last["close"])
-
-            # 当前 symbol 是否已有持仓
-            pos = (
-                db.query(Position)
-                .filter_by(symbol=symbol, account_id=acc.id, closed=0)
-                .first()
-            )
-
-            # --- 1) 有持仓：检查 TP / SL ---
-            if pos and pos.closed == 0:
-                if pos.side == "long":
-                    hit_sl = last_price <= pos.stop_loss
-                    hit_tp = last_price >= pos.take_profit
-                else:
-                    hit_sl = last_price >= pos.stop_loss
-                    hit_tp = last_price <= pos.take_profit
-
-                if hit_sl or hit_tp:
-                    close_position(db, acc, pos, last_price, reason="tp_sl_or_reverse")
-
-                # 有持仓时暂时不反向开仓，避免过度复杂
-                continue
-
-            # --- 2) 无持仓：看是否开新仓 ---
-            if side not in ("long", "short") or atr is None:
-                continue
-
-            # 基于当前账户权益按 ATR 计算目标仓位
-            qty = calc_position_size(acc.equity, atr, last_price)
-            if qty <= 0:
-                continue
-
-            # 用滑点计算预期开仓价格 + 名义价值
-            slippage = config.SLIPPAGE_RATE
-            if side == "long":
-                exec_price = last_price * (1 + slippage)
-            else:
-                exec_price = last_price * (1 - slippage)
-
-            new_notional = exec_price * qty
-
-            # 帐户层面的总杠杆限制：
-            # (已有总名义 + 新仓位名义) / 实现权益 <= MAX_LEVERAGE
-            if acc.equity <= 0:
-                continue
-
-            projected_total_notional = total_notional_existing + new_notional
-            projected_leverage = projected_total_notional / acc.equity
-
-            if projected_leverage > config.MAX_LEVERAGE:
-                # 杠杆上限超标，不开新仓
-                send_telegram(
-                    f"[拒绝开仓][杠杆过高] {symbol} 预期杠杆={projected_leverage:.2f} "
-                    f"上限={config.MAX_LEVERAGE:.2f}"
-                )
-                continue
-
-            # --- 3) 名义合理，正式建仓 ---
-            notional_open = new_notional
-            fee_open = notional_open * config.TAKER_FEE_RATE
-
-            # 立即扣除开仓手续费
-            acc.equity -= fee_open
-            acc.cash -= fee_open
-
-            # 止损止盈以开仓成交价为中心
-            if side == "long":
-                sl = exec_price - atr
-                tp = exec_price + 2 * atr
-            else:
-                sl = exec_price + atr
-                tp = exec_price - 2 * atr
-
-            pos = Position(
-                symbol=symbol,
-                side=side,
-                size=qty,
-                entry_price=exec_price,
-                atr=atr,
-                stop_loss=sl,
-                take_profit=tp,
-                account_id=acc.id,
-            )
-            db.add(pos)
-
-            total_notional_existing += notional_open  # 更新账户总名义
-
-            emoji = "📈" if side == "long" else "📉"
-            msg = (
-                f"{emoji} 开仓：{symbol} {side.upper()}\n"
-                f"数量：{qty:.4f}\n"
-                f"价格：{exec_price:.2f} USDT\n"
-                f"止损：{(exec_price - atr) if side == 'long' else (exec_price + atr):.2f}\n"
-                f"止盈：{(exec_price + 2*atr) if side == 'long' else (exec_price - 2*atr):.2f}\n"
-                f"ATR：{atr:.2f}  手续费：{fee_open:.2f}\n"
-                f"信号来源：{reason}"
-            )
-            send_telegram(msg)
-
-
-            # 开仓后发一条账户快照
-            send_account_snapshot(db, acc, prefix=f"[开仓后账户] {symbol}")
-
-        # --- 3) 本轮结束后做一次强平检查 ---
-        check_and_liquidate(db, acc)
-
-        db.commit()
-    finally:
-        db.close()
-
-async def run_signal_once(symbol: str, df: pd.DataFrame, sig: dict):
-    """
-    由 WebSocket 调用：对单个 symbol 的已收盘K线执行一次策略处理。
-    输入：
-      - symbol: 形如 "BTC/USDT"
-      - df:     包含至少 [ts, open, high, low, close, volume] 且按时间升序
-      - sig:    generate_signal() 的输出，含 side/atr/reason
-    步骤：
-      1) 如果当前有持仓 -> 检查TP/SL，触发则平仓
-      2) 如果空仓且有信号 -> 计算仓位、杠杆检查、开仓
-      3) 末尾做一次强平检查
-    """
-    # 如果被暂停交易，直接返回
-    if not is_trading_enabled():
-        return
-
-    db = SessionLocal()
-    try:
-        acc = get_account(db)
-        if not acc:
-            return
-
-        # 最新价格
-        last = df.iloc[-1]
-        last_price = float(last["close"])
-
-        side = sig.get("side")
-        atr = sig.get("atr")
-        reason = sig.get("reason", "unknown")
-
-        # 查询是否已有未平仓
-        pos = (
-            db.query(Position)
-            .filter_by(symbol=symbol, account_id=acc.id, closed=0)
-            .first()
-        )
-
-        # 1) 有持仓：检查TP/SL
-        if pos and pos.closed == 0:
-            if pos.side == "long":
-                hit_sl = last_price <= pos.stop_loss
-                hit_tp = last_price >= pos.take_profit
-            else:
-                hit_sl = last_price >= pos.stop_loss
-                hit_tp = last_price <= pos.take_profit
-
-            if hit_sl or hit_tp:
-                close_position(db, acc, pos, last_price, reason="tp_sl_or_reverse")
-                db.commit()
-                # 强平检查（尽量每次变动后检查）
-                check_and_liquidate(db, acc)
-            return
-
-        # 2) 无持仓：尝试根据信号开新仓
-        if side not in ("long", "short") or atr is None:
-            return
-
-        # 账户现有总名义（用于杠杆上限检查）
-        total_notional_existing = get_total_notional(db, acc)
-
-        # 基于 ATR 计算目标仓位
-        qty = calc_position_size(acc.equity, atr, last_price)
-        if qty <= 0:
-            return
-
-        # 成交价 + 名义 + 手续费（含滑点）
-        exec_price = last_price * (1 + SLIPPAGE_RATE) if side == "long" else last_price * (1 - SLIPPAGE_RATE)
-        notional_open = exec_price * qty
-        fee_open = notional_open * TAKER_FEE_RATE
-
-        # 杠杆上限检查
-        if (total_notional_existing + notional_open) > acc.equity * MAX_LEVERAGE:
-            send_telegram(f"⛔ 杠杆上限：拒绝开仓 {symbol} {side.upper()} 名义={notional_open:.2f}")
-            return
-
-        # 扣费、落持仓
-        acc.equity -= fee_open
-        if side == "long":
-            sl = exec_price - atr
-            tp = exec_price + 2 * atr
+    pnl_delta = 0.0
+    if pos.size == 0:
+        # 开仓
+        pos.side = side
+        pos.size = qty
+        pos.avg_price = exec_price
+    elif pos.side == side:
+        # 加仓 -> 加权均价
+        total_cost = pos.avg_price * pos.size + exec_price * qty
+        pos.size += qty
+        pos.avg_price = total_cost / max(pos.size, 1e-9)
+    else:
+        # 反向单 -> 平仓/反手
+        closed = min(pos.size, qty)
+        # 平仓盈亏
+        if pos.side == "long":
+            pnl_delta += (exec_price - pos.avg_price) * closed
         else:
-            sl = exec_price + atr
-            tp = exec_price - 2 * atr
+            pnl_delta += (pos.avg_price - exec_price) * closed
+        pos.size -= closed
+        if pos.size <= 1e-12:
+            pos.size = 0.0
+            pos.avg_price = 0.0
+            # 反手剩余
+            remain = qty - closed
+            if remain > 1e-12:
+                pos.side = side
+                pos.size = remain
+                pos.avg_price = exec_price
+        else:
+            # 部分平后仍保留原方向
+            pass
 
-        new_pos = Position(
-            symbol=symbol,
-            side=side,
-            size=qty,
-            entry_price=exec_price,
-            atr=atr,
-            stop_loss=sl,
-            take_profit=tp,
-            account_id=acc.id,
-        )
-        db.add(new_pos)
+    pos.updated_ts = time.time()
+    ACCOUNT.equity += pnl_delta - fee
 
-        # 推送
-        emoji = "📈" if side == "long" else "📉"
-        msg = (
-            f"{emoji} 开仓：{symbol} {side.upper()}\n"
-            f"数量：{qty:.4f}\n"
-            f"价格：{exec_price:.2f} USDT\n"
-            f"止损：{sl:.2f}  止盈：{tp:.2f}\n"
-            f"ATR：{atr:.2f}  手续费：{fee_open:.2f}\n"
-            f"信号来源：{reason}"
-        )
-        send_telegram(msg)
+    return {
+        "status": "filled",
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "exec_price": exec_price,
+        "fee": fee,
+        "pnl_delta": pnl_delta,
+        "equity": ACCOUNT.equity,
+        "ts": pos.updated_ts,
+    }
 
-        # 账户快照
-        send_account_snapshot(db, acc, prefix=f"[开仓后账户] {symbol}")
+# ------------ 策略入口（示例）------------
+def run_strategy_and_update_positions(signals: List[Dict]) -> List[Dict]:
+    """
+    signals: 每个信号格式建议：
+      {
+        "symbol": "BTC/USDT",
+        "action": "buy" | "sell" | "close",
+        "strength": 1.0,         # 可选，用于按强度决定下单量
+        "qty": 0.01,             # 可选，缺省将按风险百分比估算
+        "last_price": 68000.0    # 可选
+      }
+    返回：每笔执行结果列表（便于推送到 Telegram）
+    """
+    results = []
+    for s in signals:
+        symbol = s.get("symbol", SYMBOLS[0])
+        action = s.get("action", "hold").lower()
+        last_price = s.get("last_price", None)
 
-        # 3) 强平检查 & 提交
-        check_and_liquidate(db, acc)
-        db.commit()
+        if action not in ("buy", "sell", "close"):
+            continue
 
-    finally:
-        db.close()
+        # 估算下单量：按账户权益 * 风险百分比 / 当前价格（极简演示）
+        mark = None
+        if last_price is not None:
+            mark = last_price
+        try:
+            mark = mark or get_mid_price(symbol)
+        except Exception:
+            mark = last_price or 0.0
+
+        if mark <= 0:
+            # 无法取价，跳过
+            continue
+
+        if action == "close":
+            # 平掉同向仓位
+            pos = ACCOUNT.positions.get(symbol)
+            if pos and pos.size > 0:
+                side = "sell" if pos.side == "long" else "buy"
+                res = paper_execute_order(symbol, side, pos.size, last_price=mark)
+                res["note"] = "close-all"
+                results.append(res)
+            continue
+
+        # buy / sell
+        req_qty = s.get("qty")
+        if not req_qty:
+            dollar_risk = max(ACCOUNT.equity * RISK_PER_TRADE_PCT, 1.0)
+            req_qty = round(dollar_risk / mark, 6)
+
+        res = paper_execute_order(symbol, action, req_qty, last_price=mark)
+        res["note"] = "from-signal"
+        results.append(res)
+
+    # 这里你可以把 ACCOUNT/positions 持久化到数据库
+    # save_account_to_db(ACCOUNT)  # <- 接你自己的实现
+    return results
+
+# ------------ 便捷函数：查询账户与仓位 ------------
+def get_account_snapshot() -> Dict:
+    # 也可以改成数据库读
+    snap_pos = []
+    for p in ACCOUNT.positions.values():
+        if p.size <= 0:
+            continue
+        mark = 0.0
+        try:
+            mark = get_mid_price(p.symbol, fallback_last=p.avg_price)
+        except Exception:
+            mark = p.avg_price
+        unreal = (mark - p.avg_price) * p.size if p.side == "long" else (p.avg_price - mark) * p.size
+        snap_pos.append({
+            "symbol": p.symbol,
+            "side": p.side,
+            "size": p.size,
+            "avg_price": p.avg_price,
+            "mark": mark,
+            "unrealized_pnl": unreal,
+            "updated_ts": p.updated_ts
+        }
