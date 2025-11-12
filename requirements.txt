@@ -6,3 +6,4 @@ pandas
 SQLAlchemy
 psycopg2-binary
 anyio
+python-binance
