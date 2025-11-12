@@ -15,6 +15,16 @@ from .telegram_bot import telegram_command_loop
 
 app = FastAPI()
 
+import os
+USE_REST_WORKER = os.getenv("USE_REST_WORKER", "0") == "1"
+
+@app.on_event("startup")
+async def startup_event():
+    init_db_and_account()
+    asyncio.create_task(telegram_command_loop())
+
+    if USE_REST_WORKER:
+        asyncio.create_task(worker_loop())
 
 @app.get("/health")
 async def health():
