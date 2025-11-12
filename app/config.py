@@ -34,3 +34,6 @@ SLIPPAGE_RATE = float(os.getenv("SLIPPAGE_RATE", "0.0005"))
 
 # 数据库（Railway Postgres 的连接串）
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+PROCESS_ROLE = os.getenv("PROCESS_ROLE", "web")  # web / worker
+TELEGRAM_LOOP_ENABLED = os.getenv("TELEGRAM_LOOP_ENABLED", "1") == "1"
