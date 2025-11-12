@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 import asyncio
 import datetime
+import os
 
 from .trading_engine import (
     init_db_and_account,
@@ -10,21 +11,34 @@ from .trading_engine import (
     compute_account_margin_and_unrealized,
     compute_position_margin_and_liq,
 )
+from . import config
 from .telegram_bot import telegram_command_loop
 
 
 app = FastAPI()
 
-import os
-USE_REST_WORKER = os.getenv("USE_REST_WORKER", "0") == "1"
+
+# 从环境变量读取（避免多个实例重复启动 Telegram 循环）
+PROCESS_ROLE = os.getenv("PROCESS_ROLE", "web")       # web / worker
+TELEGRAM_LOOP_ENABLED = os.getenv("TELEGRAM_LOOP_ENABLED", "1") == "1"
+
 
 @app.on_event("startup")
 async def startup_event():
+    """系统启动时初始化"""
     init_db_and_account()
-    asyncio.create_task(telegram_command_loop())
 
-    if USE_REST_WORKER:
+    # ✅ 只在 web 进程 并且允许时启动 Telegram 命令循环
+    if PROCESS_ROLE == "web" and TELEGRAM_LOOP_ENABLED:
+        asyncio.create_task(telegram_command_loop())
+        print("✅ Telegram 命令循环已启动（web 实例）")
+    else:
+        print("🚫 当前实例未启用 Telegram 命令循环")
+
+    # ✅ 启动策略循环（只在 web 启动，worker 专注行情）
+    if PROCESS_ROLE == "web":
         asyncio.create_task(worker_loop())
+
 
 @app.get("/health")
 async def health():
@@ -34,14 +48,7 @@ async def health():
 @app.get("/account_stats")
 async def account_stats():
     """
-    返回当前账户的整体保证金情况 + 持仓列表：
-      - equity: 账面权益（已实现盈亏）
-      - equity_mtm: 按最新价计的市值权益
-      - used_margin: 已用初始保证金
-      - maint_margin_total: 总维持保证金
-      - free_margin: 可用保证金
-      - account_leverage: 当前总杠杆
-      - positions: 每个持仓的详细信息（方向/大小/爆仓价等）
+    返回当前账户的整体保证金情况 + 持仓列表。
     """
     db = SessionLocal()
     try:
@@ -86,17 +93,6 @@ async def account_stats():
         }
     finally:
         db.close()
-
-
-@app.on_event("startup")
-async def startup_event():
-    # 初始化数据库和虚拟账户
-    init_db_and_account()
-    # 启动后台策略循环
-    asyncio.create_task(worker_loop())
-    # 启动 Telegram 命令监听循环
-    asyncio.create_task(telegram_command_loop())
-
 
 
 async def worker_loop():
