@@ -3,7 +3,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List
 
-from import config
+import config
 from exchange_client import get_mid_price
 from slippage import compute_exec_price
 
