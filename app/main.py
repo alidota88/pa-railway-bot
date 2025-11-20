@@ -1,3 +1,5 @@
+print(">>> USING NEW main.py WITH DOT IMPORT <<<")
+
 from fastapi import FastAPI
 import asyncio
 import datetime
