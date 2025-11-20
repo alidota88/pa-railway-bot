@@ -1,2 +1,2 @@
-web: uvicorn app.main:app --host 0.0.0.0 --port $PORT
-worker: python -m app.data_stream_ws
+web: cd app && uvicorn main:app --host 0.0.0.0 --port $PORT
+worker: cd app && python data_stream_ws.py
