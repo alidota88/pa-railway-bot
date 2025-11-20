@@ -3,9 +3,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List
 
-import config
-from exchange_client import get_mid_price
-from slippage import compute_exec_price
+from .import config
+from .exchange_client import get_mid_price
+from .slippage import compute_exec_price
 
 # ============== 账户/仓位模型 ==============
 @dataclass
