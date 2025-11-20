@@ -3,7 +3,7 @@ import asyncio
 import datetime
 import os
 
-from trading_engine import (
+from .trading_engine import (
     init_db_and_account,
     run_cycle_once,
     SessionLocal,
